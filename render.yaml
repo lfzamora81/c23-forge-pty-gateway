@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: c23-forge-e2b-pty-gateway
+    runtime: node
+    plan: standard
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: E2B_API_KEY
+        sync: false
+      - key: TERMINAL_TOKEN_SECRET
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
