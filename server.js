@@ -15,6 +15,7 @@ const TERMINAL_TOKEN_SECRET = process.env.TERMINAL_TOKEN_SECRET;
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim());
 const SESSION_GRACE_MS = parseInt(process.env.SESSION_GRACE_MS || '300000', 10);
 const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '1800000', 10);
+const SANDBOX_TIMEOUT_MS = parseInt(process.env.SANDBOX_TIMEOUT_MS || '3600000', 10);
 const DEFAULT_TEMPLATE_ID = process.env.DEFAULT_TEMPLATE_ID || 'base';
 
 if (!E2B_API_KEY) throw new Error('E2B_API_KEY required');
