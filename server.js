@@ -58,21 +58,54 @@ wss.on('connection', (ws, req) => {
   ws.on('message', async (data) => {
     try {
       const msg = JSON.parse(data.toString());
+      
+      if (msg.type === 'ping') {
+        sendMessage({
+        type: 'pong',
+        ts: Date.now()
+        });
+        return;
+      }
+      
       if (msg.type === 'start') {
         const payload = jwt.verify(msg.token, TERMINAL_TOKEN_SECRET, { algorithms: ['HS256'] });
         sessionId = uuidv4();
-        sandbox = await Sandbox.create(msg.template || DEFAULT_TEMPLATE_ID, { apiKey: E2B_API_KEY });
+        sandbox = await Sandbox.create(msg.template || DEFAULT_TEMPLATE_ID, {
+          apiKey: E2B_API_KEY,
+          timeoutMs: SANDBOX_TIMEOUT_MS
+        });
         terminal = await sandbox.pty.create({
           cols: msg.cols || 80,
           rows: msg.rows || 24,
-          onData: (data) => sendMessage({ type: 'output', data: Buffer.from(data).toString('base64'), encoding: 'base64' }),
+          timeoutMs: 0,
+          cwd: '/home/user',
+          envs: { TERM: 'xterm-256color' },
+          onData: (data) => sendMessage({
+            type: 'output',
+            data: Buffer.from(data).toString('base64'),
+            encoding: 'base64'
+            }),
         });
         sessions.set(sessionId, { ws, sandbox, terminal });
         sendMessage({ type: 'ready', sandboxId: sandbox.sandboxId, pid: terminal.pid });
       } else if (msg.type === 'input' && terminal) {
-        await sandbox.pty.sendInput(terminal.pid, new TextEncoder().encode(msg.data));
+        if (typeof sandbox?.setTimeout === 'function') {
+          await sandbox.setTimeout(SANDBOX_TIMEOUT_MS);
+        }
+
+        await sandbox.pty.sendInput(
+          terminal.pid,
+          new TextEncoder().encode(msg.data)
+        );
       } else if (msg.type === 'resize' && terminal) {
-        await sandbox.pty.resize(terminal.pid, { cols: msg.cols, rows: msg.rows });
+        if (typeof sandbox?.setTimeout === 'function') {
+          await sandbox.setTimeout(SANDBOX_TIMEOUT_MS);
+        }
+
+        await sandbox.pty.resize(terminal.pid, {
+          cols: msg.cols,
+          rows: msg.rows
+        });
       } else if (msg.type === 'kill') {
         await cleanupSession();
         ws.close();
