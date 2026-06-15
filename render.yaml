@@ -7,9 +7,21 @@ services:
     startCommand: npm start
     healthCheckPath: /health
     envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
       - key: E2B_API_KEY
         sync: false
       - key: TERMINAL_TOKEN_SECRET
         sync: false
       - key: ALLOWED_ORIGINS
         sync: false
+      - key: SESSION_GRACE_MS
+        value: 300000
+      - key: IDLE_TIMEOUT_MS
+        value: 1800000
+      - key: DEFAULT_TEMPLATE_ID
+        value: base
+      - key: SANDBOX_TIMEOUT_MS
+        value: 3600000
