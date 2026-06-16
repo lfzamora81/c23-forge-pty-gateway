@@ -17,6 +17,10 @@ const SESSION_GRACE_MS = parseInt(process.env.SESSION_GRACE_MS || '300000', 10);
 const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || '1800000', 10);
 const SANDBOX_TIMEOUT_MS = parseInt(process.env.SANDBOX_TIMEOUT_MS || '3600000', 10);
 const DEFAULT_TEMPLATE_ID = process.env.DEFAULT_TEMPLATE_ID || 'base';
+const TERMINAL_IDLE_TIMEOUT_MS = parseInt(
+  process.env.TERMINAL_IDLE_TIMEOUT_MS || process.env.IDLE_TIMEOUT_MS || '7200000',
+  10
+);
 
 if (!E2B_API_KEY) throw new Error('E2B_API_KEY required');
 if (!TERMINAL_TOKEN_SECRET) throw new Error('TERMINAL_TOKEN_SECRET required');
@@ -72,7 +76,11 @@ wss.on('connection', (ws, req) => {
         sessionId = uuidv4();
         sandbox = await Sandbox.create(msg.template || DEFAULT_TEMPLATE_ID, {
           apiKey: E2B_API_KEY,
-          timeoutMs: SANDBOX_TIMEOUT_MS
+          timeoutMs: TERMINAL_IDLE_TIMEOUT_MS,
+          lifecycle: {
+            onTimeout: 'pause',
+            autoResume: false
+          }
         });
         terminal = await sandbox.pty.create({
           cols: msg.cols || 80,
@@ -88,7 +96,61 @@ wss.on('connection', (ws, req) => {
         });
         sessions.set(sessionId, { ws, sandbox, terminal });
         sendMessage({ type: 'ready', sandboxId: sandbox.sandboxId, pid: terminal.pid });
-      } else if (msg.type === 'input' && terminal) {
+      } else if (msg.type === 'resume') {
+        const payload = jwt.verify(msg.token, TERMINAL_TOKEN_SECRET, { algorithms: ['HS256'] });
+
+        const sandboxId = msg.sandboxId || payload.sandboxId;
+        const ptyPid = msg.ptyPid || msg.pid || payload.ptyPid || payload.pid;
+
+        if (!sandboxId || !ptyPid) {
+          sendMessage({
+            type: 'error',
+            message: 'Cannot resume terminal: sandboxId and ptyPid are required.'
+          });
+          return;
+        }
+
+        sessionId = msg.gatewaySessionId || payload.gatewaySessionId || uuidv4();
+
+        sandbox = await Sandbox.connect(sandboxId, {
+          apiKey: E2B_API_KEY,
+          timeoutMs: TERMINAL_IDLE_TIMEOUT_MS
+        });
+
+        terminal = await sandbox.pty.connect(Number(ptyPid), {
+          onData: (data) => sendMessage({
+            type: 'output',
+            data: Buffer.from(data).toString('base64'),
+            encoding: 'base64'
+          })
+        });
+
+        if (msg.cols && msg.rows) {
+          await sandbox.pty.resize(Number(ptyPid), {
+            cols: msg.cols,
+            rows: msg.rows
+          });
+        }
+
+        sessions.set(sessionId, {
+          ws,
+          sandbox,
+          terminal,
+          sandboxId,
+          ptyPid: Number(ptyPid),
+          lastActiveAt: Date.now()
+        });
+
+        sendMessage({
+          type: 'ready',
+          resumed: true,
+          gatewaySessionId: sessionId,
+          sandboxId,
+          pid: Number(ptyPid),
+          ptyPid: Number(ptyPid)
+        });
+
+      else if (msg.type === 'input' && terminal) {
         if (typeof sandbox?.setTimeout === 'function') {
           await sandbox.setTimeout(SANDBOX_TIMEOUT_MS);
         }
@@ -113,7 +175,25 @@ wss.on('connection', (ws, req) => {
     } catch (e) { console.error('[msg error]', e.message); }
   });
 
-  ws.on('close', () => setTimeout(cleanupSession, SESSION_GRACE_MS));
+  ws.on('close', async () => {
+  console.log('[WS] detached', sessionId || '(unstarted)');
+
+    try {
+      if (terminal && typeof terminal.disconnect === 'function') {
+        await terminal.disconnect();
+      }
+    } catch (e) {
+      console.warn('[detach] terminal disconnect failed:', e.message);
+    }
+
+    if (sessionId && sessions.has(sessionId)) {
+      const session = sessions.get(sessionId);
+      session.ws = null;
+      session.terminal = null;
+      session.detachedAt = Date.now();
+      sessions.set(sessionId, session);
+    }
+  });
 });
 
 server.listen(PORT, () => console.log(`[gateway] listening on port ${PORT}`));
