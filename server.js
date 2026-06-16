@@ -25,38 +25,27 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .map((s) => s.trim())
   .filter(Boolean);
 
+const ALLOWED_ORIGIN_SUFFIXES = (process.env.ALLOWED_ORIGIN_SUFFIXES || '')
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean)
+  .map((s) => (s.startsWith('.') ? s : `.${s}`));
+
 const DEFAULT_TEMPLATE_ID = process.env.DEFAULT_TEMPLATE_ID || 'base';
 
-/**
- * How long the sandbox should stay running without user activity before E2B
- * times it out. Because lifecycle.onTimeout is set to "pause", timeout should
- * preserve state instead of killing the VM.
- *
- * Keep this configurable in Render. E2B plan limits still apply.
- */
 const TERMINAL_IDLE_TIMEOUT_MS = parseMs(
-  process.env.TERMINAL_IDLE_TIMEOUT_MS || process.env.SANDBOX_TIMEOUT_MS || process.env.IDLE_TIMEOUT_MS,
+  process.env.TERMINAL_IDLE_TIMEOUT_MS ||
+    process.env.SANDBOX_TIMEOUT_MS ||
+    process.env.IDLE_TIMEOUT_MS,
   60 * 60 * 1000
 );
 
-/**
- * How long the gateway will wait for E2B create/connect/PTY operations before
- * returning an explicit error to the browser.
- */
 const START_TIMEOUT_MS = parseMs(process.env.START_TIMEOUT_MS, 90 * 1000);
-
-/**
- * Protocol-level WebSocket heartbeat from gateway to browser. This is separate
- * from the app-level JSON ping/pong used by Base44.
- */
 const PROTOCOL_HEARTBEAT_MS = parseMs(process.env.PROTOCOL_HEARTBEAT_MS, 30 * 1000);
-
-/**
- * How long to keep an in-memory detached session record in this Node process.
- * This does not kill the E2B sandbox. It only prunes Render gateway memory.
- * The real source of truth for reconnect is Base44's saved sandbox_id + pty_pid.
- */
-const DETACHED_RECORD_TTL_MS = parseMs(process.env.DETACHED_RECORD_TTL_MS, 6 * 60 * 60 * 1000);
+const DETACHED_RECORD_TTL_MS = parseMs(
+  process.env.DETACHED_RECORD_TTL_MS,
+  6 * 60 * 60 * 1000
+);
 
 if (!E2B_API_KEY) throw new Error('E2B_API_KEY required');
 if (!TERMINAL_TOKEN_SECRET) throw new Error('TERMINAL_TOKEN_SECRET required');
@@ -65,16 +54,18 @@ const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/terminal' });
 
-app.use(cors({
-  origin(origin, callback) {
-    if (!origin || ALLOWED_ORIGINS.length === 0 || ALLOWED_ORIGINS.includes(origin)) {
-      callback(null, true);
-      return;
-    }
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (isAllowedOrigin(origin)) {
+        callback(null, true);
+        return;
+      }
 
-    callback(new Error(`Origin not allowed: ${origin}`));
-  },
-}));
+      callback(new Error(`Origin not allowed: ${origin}`));
+    },
+  })
+);
 
 app.use(express.json());
 
@@ -98,8 +89,32 @@ function withTimeout(promise, ms, label) {
 }
 
 function isAllowedOrigin(origin) {
-  if (ALLOWED_ORIGINS.length === 0) return true;
-  return Boolean(origin && ALLOWED_ORIGINS.includes(origin));
+  if (!origin) return true;
+
+  if (ALLOWED_ORIGINS.includes(origin)) {
+    return true;
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    return false;
+  }
+
+  const protocol = parsed.protocol;
+  const hostname = parsed.hostname.toLowerCase();
+
+  const isLocalhost =
+    hostname === 'localhost' ||
+    hostname === '127.0.0.1' ||
+    hostname === '::1';
+
+  if (protocol !== 'https:' && !(protocol === 'http:' && isLocalhost)) {
+    return false;
+  }
+
+  return ALLOWED_ORIGIN_SUFFIXES.some((suffix) => hostname.endsWith(suffix));
 }
 
 function parseJsonMessage(data) {
@@ -134,6 +149,37 @@ function getTemplateId(msg) {
   return msg.template || msg.templateId || DEFAULT_TEMPLATE_ID;
 }
 
+function getDiagnosticId(msg) {
+  return msg?.diagnosticId || msg?.diagnostic_id || 'no-diagnostic-id';
+}
+
+function logWithDiag(diagnosticId, message, data = undefined) {
+  if (data === undefined) {
+    console.log(`[${diagnosticId}] ${message}`);
+    return;
+  }
+
+  console.log(`[${diagnosticId}] ${message}`, data);
+}
+
+function warnWithDiag(diagnosticId, message, data = undefined) {
+  if (data === undefined) {
+    console.warn(`[${diagnosticId}] ${message}`);
+    return;
+  }
+
+  console.warn(`[${diagnosticId}] ${message}`, data);
+}
+
+function errorWithDiag(diagnosticId, message, data = undefined) {
+  if (data === undefined) {
+    console.error(`[${diagnosticId}] ${message}`);
+    return;
+  }
+
+  console.error(`[${diagnosticId}] ${message}`, data);
+}
+
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -146,6 +192,7 @@ app.get('/health', (req, res) => {
       protocolHeartbeatMs: PROTOCOL_HEARTBEAT_MS,
       detachedRecordTtlMs: DETACHED_RECORD_TTL_MS,
       allowedOriginsConfigured: ALLOWED_ORIGINS.length,
+      allowedOriginSuffixesConfigured: ALLOWED_ORIGIN_SUFFIXES.length,
       websocketPath: '/terminal',
     },
   });
@@ -172,6 +219,7 @@ wss.on('connection', (ws, req) => {
   let readySent = false;
   let createdSandboxInThisConnection = false;
   let detached = false;
+  let currentDiagnosticId = 'no-diagnostic-id';
 
   const sendMessage = (msg) => {
     if (ws.readyState === WS_OPEN) {
@@ -187,10 +235,11 @@ wss.on('connection', (ws, req) => {
       type: 'error',
       code,
       message,
+      diagnosticId: currentDiagnosticId,
       ...extra,
     };
 
-    console.error('[gateway error]', code, message);
+    errorWithDiag(currentDiagnosticId, `[gateway error] ${code}: ${message}`);
     sendMessage(payload);
   };
 
@@ -201,10 +250,11 @@ wss.on('connection', (ws, req) => {
       await sandbox.setTimeout(TERMINAL_IDLE_TIMEOUT_MS);
     } catch (error) {
       const message = safePublicError(error);
-      console.warn('[timeout refresh failed]', message);
+      warnWithDiag(currentDiagnosticId, '[timeout refresh failed]', message);
       sendMessage({
         type: 'warning',
         code: 'TIMEOUT_REFRESH_FAILED',
+        diagnosticId: currentDiagnosticId,
         message,
       });
     }
@@ -222,6 +272,7 @@ wss.on('connection', (ws, req) => {
       ptyPid,
       lastActiveAt: Date.now(),
       detachedAt: null,
+      diagnosticId: currentDiagnosticId,
       ...record,
     });
   };
@@ -231,6 +282,7 @@ wss.on('connection', (ws, req) => {
 
     const session = sessions.get(sessionId);
     session.lastActiveAt = Date.now();
+    session.diagnosticId = currentDiagnosticId;
     sessions.set(sessionId, session);
   };
 
@@ -238,7 +290,7 @@ wss.on('connection', (ws, req) => {
     if (detached) return;
     detached = true;
 
-    console.log('[WS] detached', {
+    logWithDiag(currentDiagnosticId, '[WS] detached', {
       sessionId: sessionId || '(unstarted)',
       sandboxId: sandboxId || '(none)',
       ptyPid: ptyPid || '(none)',
@@ -250,7 +302,7 @@ wss.on('connection', (ws, req) => {
         await terminal.disconnect();
       }
     } catch (error) {
-      console.warn('[detach] terminal disconnect failed:', safePublicError(error));
+      warnWithDiag(currentDiagnosticId, '[detach] terminal disconnect failed', safePublicError(error));
     }
 
     if (sessionId && sessions.has(sessionId)) {
@@ -258,12 +310,13 @@ wss.on('connection', (ws, req) => {
       session.ws = null;
       session.terminal = null;
       session.detachedAt = Date.now();
+      session.diagnosticId = currentDiagnosticId;
       sessions.set(sessionId, session);
     }
   };
 
   const cleanupSession = async (reason = 'cleanup requested') => {
-    console.log('[cleanup] requested', {
+    logWithDiag(currentDiagnosticId, '[cleanup] requested', {
       reason,
       sessionId: sessionId || '(unstarted)',
       sandboxId: sandboxId || '(none)',
@@ -274,28 +327,32 @@ wss.on('connection', (ws, req) => {
       if (terminal && sandbox && ptyPid) {
         try {
           await sandbox.pty.kill(ptyPid);
-          console.log('[cleanup] pty killed', ptyPid);
+          logWithDiag(currentDiagnosticId, '[cleanup] pty killed', { ptyPid });
         } catch (error) {
-          console.warn('[cleanup] pty kill failed:', safePublicError(error));
+          warnWithDiag(currentDiagnosticId, '[cleanup] pty kill failed', safePublicError(error));
         }
       }
 
       if (sandbox) {
         try {
           await sandbox.kill();
-          console.log('[cleanup] sandbox killed', sandboxId || sandbox.sandboxId);
+          logWithDiag(currentDiagnosticId, '[cleanup] sandbox killed', {
+            sandboxId: sandboxId || sandbox.sandboxId,
+          });
         } catch (error) {
-          console.warn('[cleanup] sandbox kill failed:', safePublicError(error));
+          warnWithDiag(currentDiagnosticId, '[cleanup] sandbox kill failed', safePublicError(error));
         }
       }
 
       if (sessionId) sessions.delete(sessionId);
     } catch (error) {
-      console.error('[cleanup] failed:', safePublicError(error));
+      errorWithDiag(currentDiagnosticId, '[cleanup] failed', safePublicError(error));
     }
   };
 
   const startSession = async (msg) => {
+    currentDiagnosticId = getDiagnosticId(msg);
+
     if (sandbox || terminal) {
       sendError('SESSION_ALREADY_STARTED', 'This WebSocket already has a terminal session.');
       return;
@@ -306,7 +363,7 @@ wss.on('connection', (ws, req) => {
     sessionId = uuidv4();
     const templateId = getTemplateId(msg);
 
-    console.log('[start] creating sandbox', {
+    logWithDiag(currentDiagnosticId, '[start] creating sandbox', {
       sessionId,
       templateId,
       terminalIdleTimeoutMs: TERMINAL_IDLE_TIMEOUT_MS,
@@ -330,7 +387,7 @@ wss.on('connection', (ws, req) => {
       createdSandboxInThisConnection = true;
       sandboxId = sandbox.sandboxId;
 
-      console.log('[start] sandbox created', {
+      logWithDiag(currentDiagnosticId, '[start] sandbox created', {
         sessionId,
         sandboxId,
       });
@@ -345,6 +402,7 @@ wss.on('connection', (ws, req) => {
           onData: (data) => {
             sendMessage({
               type: 'output',
+              diagnosticId: currentDiagnosticId,
               data: Buffer.from(data).toString('base64'),
               encoding: 'base64',
             });
@@ -368,7 +426,7 @@ wss.on('connection', (ws, req) => {
         resumed: false,
       });
 
-      console.log('[start] ready', {
+      logWithDiag(currentDiagnosticId, '[start] ready', {
         sessionId,
         sandboxId,
         ptyPid,
@@ -376,6 +434,7 @@ wss.on('connection', (ws, req) => {
 
       sendMessage({
         type: 'ready',
+        diagnosticId: currentDiagnosticId,
         resumed: false,
         gatewaySessionId: sessionId,
         sandboxId,
@@ -393,6 +452,8 @@ wss.on('connection', (ws, req) => {
   };
 
   const resumeSession = async (msg) => {
+    currentDiagnosticId = getDiagnosticId(msg);
+
     if (sandbox || terminal) {
       sendError('SESSION_ALREADY_STARTED', 'This WebSocket already has a terminal session.');
       return;
@@ -415,7 +476,7 @@ wss.on('connection', (ws, req) => {
 
     sessionId = msg.gatewaySessionId || payload.gatewaySessionId || uuidv4();
 
-    console.log('[resume] connecting', {
+    logWithDiag(currentDiagnosticId, '[resume] connecting', {
       sessionId,
       sandboxId,
       ptyPid,
@@ -438,6 +499,7 @@ wss.on('connection', (ws, req) => {
           onData: (data) => {
             sendMessage({
               type: 'output',
+              diagnosticId: currentDiagnosticId,
               data: Buffer.from(data).toString('base64'),
               encoding: 'base64',
             });
@@ -465,7 +527,7 @@ wss.on('connection', (ws, req) => {
         resumed: true,
       });
 
-      console.log('[resume] ready', {
+      logWithDiag(currentDiagnosticId, '[resume] ready', {
         sessionId,
         sandboxId,
         ptyPid,
@@ -473,6 +535,7 @@ wss.on('connection', (ws, req) => {
 
       sendMessage({
         type: 'ready',
+        diagnosticId: currentDiagnosticId,
         resumed: true,
         gatewaySessionId: sessionId,
         sandboxId,
@@ -482,7 +545,7 @@ wss.on('connection', (ws, req) => {
     } catch (error) {
       const message = safePublicError(error);
 
-      console.error('[resume failed]', {
+      errorWithDiag(currentDiagnosticId, '[resume failed]', {
         sessionId,
         sandboxId,
         ptyPid,
@@ -508,10 +571,13 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    currentDiagnosticId = getDiagnosticId(msg);
+
     try {
       if (msg.type === 'ping') {
         sendMessage({
           type: 'pong',
+          diagnosticId: currentDiagnosticId,
           ts: Date.now(),
         });
         return;
@@ -573,12 +639,21 @@ wss.on('connection', (ws, req) => {
       sendError('UNSUPPORTED_MESSAGE', `Unsupported message type: ${msg.type}`);
     } catch (error) {
       const message = safePublicError(error);
-      console.error('[msg error]', message);
+      errorWithDiag(currentDiagnosticId, '[msg error]', message);
       sendError('MESSAGE_HANDLER_FAILED', message);
     }
   });
 
-  ws.on('close', async () => {
+  ws.on('close', async (code, reasonBuffer) => {
+    const reason = reasonBuffer?.toString?.() || '';
+
+    logWithDiag(currentDiagnosticId, '[WS] closed', {
+      code,
+      reason,
+      readySent,
+      createdSandboxInThisConnection,
+    });
+
     if (!readySent && createdSandboxInThisConnection) {
       await cleanupSession('socket closed before ready');
       return;
@@ -588,7 +663,7 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('error', (error) => {
-    console.error('[WS] error', safePublicError(error));
+    errorWithDiag(currentDiagnosticId, '[WS] error', safePublicError(error));
   });
 });
 
@@ -616,6 +691,7 @@ const pruneDetachedRecords = setInterval(() => {
       sessions.delete(id);
       console.log('[sessions] pruned detached record', {
         sessionId: id,
+        diagnosticId: session.diagnosticId || 'no-diagnostic-id',
         ageMs,
       });
     }
@@ -636,6 +712,7 @@ server.listen(PORT, () => {
     protocolHeartbeatMs: PROTOCOL_HEARTBEAT_MS,
     detachedRecordTtlMs: DETACHED_RECORD_TTL_MS,
     allowedOriginsConfigured: ALLOWED_ORIGINS.length,
+    allowedOriginSuffixesConfigured: ALLOWED_ORIGIN_SUFFIXES.length,
     websocketPath: '/terminal',
   });
 });
