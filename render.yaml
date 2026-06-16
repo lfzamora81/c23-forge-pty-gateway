@@ -9,27 +9,34 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+
       - key: PORT
         value: 10000
 
       # Secrets / account-specific values. Set these in Render.
       - key: E2B_API_KEY
         sync: false
+
       - key: TERMINAL_TOKEN_SECRET
         sync: false
+
+      # Exact allowlist. Keep at least the production Base44 origin here.
+      # Additional exact origins can be comma-separated in the Render dashboard.
       - key: ALLOWED_ORIGINS
         sync: false
+
+      # Allows dynamic Base44 preview/sandbox subdomains such as:
+      # https://preview--master-modern-c.base44.app
+      # https://preview-sandbox--<id>.base44.app
+      - key: ALLOWED_ORIGIN_SUFFIXES
+        value: .base44.app
 
       # E2B template. "base" uses the default public/base sandbox.
       - key: DEFAULT_TEMPLATE_ID
         value: base
 
-      # How long E2B should keep the sandbox running without user activity
-      # before timeout behavior triggers. With lifecycle.onTimeout="pause",
-      # the sandbox should pause rather than kill, preserving files/process state.
-      #
-      # Safe default: 1 hour. You can increase later from Render env vars
-      # if your E2B plan supports longer continuous runtime.
+      # How long E2B should keep the sandbox running without user activity.
+      # This remains configurable from Render without code changes.
       - key: TERMINAL_IDLE_TIMEOUT_MS
         value: 3600000
 
@@ -45,16 +52,17 @@ services:
       - key: PROTOCOL_HEARTBEAT_MS
         value: 30000
 
-      # Only prunes detached session metadata from the Render process memory.
+      # Only prunes detached session metadata from Render process memory.
       # Does not kill the E2B sandbox.
       - key: DETACHED_RECORD_TTL_MS
         value: 21600000
 
-      # Legacy value kept for compatibility with older docs/code, but the new
-      # gateway does not kill sandboxes merely because the browser navigates away.
+      # Legacy value kept for compatibility with older docs/code.
+      # The gateway no longer kills sandboxes merely because the browser navigates away.
       - key: SESSION_GRACE_MS
         value: 300000
 
-      # Legacy value kept for compatibility; TERMINAL_IDLE_TIMEOUT_MS is canonical.
+      # Legacy value kept for compatibility.
+      # TERMINAL_IDLE_TIMEOUT_MS is canonical.
       - key: IDLE_TIMEOUT_MS
         value: 3600000
