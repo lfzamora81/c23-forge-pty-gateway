@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: c23-forge-e2b-pty-gateway
+    name: c23-forge-pty-gateway
     runtime: node
     plan: standard
     buildCommand: npm install
@@ -11,17 +11,50 @@ services:
         value: production
       - key: PORT
         value: 10000
+
+      # Secrets / account-specific values. Set these in Render.
       - key: E2B_API_KEY
         sync: false
       - key: TERMINAL_TOKEN_SECRET
         sync: false
       - key: ALLOWED_ORIGINS
         sync: false
-      - key: SESSION_GRACE_MS
-        value: 300000
-      - key: IDLE_TIMEOUT_MS
-        value: 1800000
+
+      # E2B template. "base" uses the default public/base sandbox.
       - key: DEFAULT_TEMPLATE_ID
         value: base
+
+      # How long E2B should keep the sandbox running without user activity
+      # before timeout behavior triggers. With lifecycle.onTimeout="pause",
+      # the sandbox should pause rather than kill, preserving files/process state.
+      #
+      # Safe default: 1 hour. You can increase later from Render env vars
+      # if your E2B plan supports longer continuous runtime.
+      - key: TERMINAL_IDLE_TIMEOUT_MS
+        value: 3600000
+
+      # Backward-compatible alias used by older gateway code paths.
       - key: SANDBOX_TIMEOUT_MS
+        value: 3600000
+
+      # Gateway-side create/connect/PTY operation timeout.
+      - key: START_TIMEOUT_MS
+        value: 90000
+
+      # Node WebSocket protocol-level heartbeat.
+      - key: PROTOCOL_HEARTBEAT_MS
+        value: 30000
+
+      # Only prunes detached session metadata from the Render process memory.
+      # Does not kill the E2B sandbox.
+      - key: DETACHED_RECORD_TTL_MS
+        value: 21600000
+
+      # Legacy value kept for compatibility with older docs/code, but the new
+      # gateway does not kill sandboxes merely because the browser navigates away.
+      - key: SESSION_GRACE_MS
+        value: 300000
+
+      # Legacy value kept for compatibility; TERMINAL_IDLE_TIMEOUT_MS is canonical.
+      - key: IDLE_TIMEOUT_MS
         value: 3600000
