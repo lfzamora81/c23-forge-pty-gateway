@@ -1,6 +1,6 @@
 {
   "name": "c23-forge-e2b-pty-gateway",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "private": true,
   "scripts": {
@@ -12,6 +12,7 @@
     "dotenv": "^16.4.7",
     "e2b": "latest",
     "express": "^4.18.3",
+    "ioredis": "^5.4.2",
     "jsonwebtoken": "^9.0.2",
     "uuid": "^9.0.1",
     "ws": "^8.18.0"

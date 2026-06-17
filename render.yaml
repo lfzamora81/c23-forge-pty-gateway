@@ -32,17 +32,19 @@ services:
         value: .base44.app
 
       # E2B template. "base" uses the default public/base sandbox.
+      # Replace with the custom C23 template ID after the E2B template is built.
       - key: DEFAULT_TEMPLATE_ID
         value: base
 
-      # How long E2B should keep the sandbox running without user activity.
-      # This remains configurable from Render without code changes.
+      # E2B sandbox keepalive timeout.
+      # Should be at least ATTACHED_IDLE_WARNING_MS + ATTACHED_IDLE_EXPIRE_AFTER_WARNING_MS.
+      # 15,000,000 ms = 4h 10m.
       - key: TERMINAL_IDLE_TIMEOUT_MS
-        value: 3600000
+        value: 15000000
 
-      # Backward-compatible alias used by older gateway code paths.
+      # Backward-compatible alias used by older gateway/client code paths.
       - key: SANDBOX_TIMEOUT_MS
-        value: 3600000
+        value: 15000000
 
       # Gateway-side create/connect/PTY operation timeout.
       - key: START_TIMEOUT_MS
@@ -52,17 +54,42 @@ services:
       - key: PROTOCOL_HEARTBEAT_MS
         value: 30000
 
-      # Only prunes detached session metadata from Render process memory.
-      # Does not kill the E2B sandbox.
-      - key: DETACHED_RECORD_TTL_MS
-        value: 21600000
+      # Minimum product promise for short disconnects.
+      # This is informational for the client; hard cleanup uses DETACHED_EXPIRE_MS.
+      - key: DETACHED_GRACE_MS
+        value: 900000
 
-      # Legacy value kept for compatibility with older docs/code.
-      # The gateway no longer kills sandboxes merely because the browser navigates away.
-      - key: SESSION_GRACE_MS
-        value: 300000
-
-      # Legacy value kept for compatibility.
-      # TERMINAL_IDLE_TIMEOUT_MS is canonical.
-      - key: IDLE_TIMEOUT_MS
+      # Detached learner environments are eligible for gateway cleanup after 60 minutes.
+      - key: DETACHED_EXPIRE_MS
         value: 3600000
+
+      # Netflix-style warning threshold while a terminal remains attached but idle.
+      # 14,400,000 ms = 4h.
+      - key: ATTACHED_IDLE_WARNING_MS
+        value: 14400000
+
+      # Expire 10 minutes after idle warning if the learner does not confirm activity.
+      - key: ATTACHED_IDLE_EXPIRE_AFTER_WARNING_MS
+        value: 600000
+
+      # How long environment records remain in Redis or process memory before natural expiry.
+      # 86,400,000 ms = 24h.
+      - key: ENVIRONMENT_RECORD_TTL_MS
+        value: 86400000
+
+      # How frequently the gateway checks for detached/idle environments.
+      - key: ENVIRONMENT_SWEEP_MS
+        value: 60000
+
+      # Throttle E2B setTimeout refresh calls so terminal output does not spam the API.
+      - key: TIMEOUT_REFRESH_THROTTLE_MS
+        value: 60000
+
+      # Default false: legacy "start" is upgraded to learner-environment get-or-create
+      # when the JWT contains a stable user identity claim.
+      - key: ENABLE_LEGACY_START_CREATES_NEW
+        value: false
+
+      # Optional but recommended for cleaner production persistence across Render restarts:
+      # Set REDIS_URL manually in the Render dashboard if using Upstash/Redis.
+      # Do not commit a real Redis URL here.
