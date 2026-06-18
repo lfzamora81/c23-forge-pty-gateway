@@ -50,14 +50,22 @@ const ATTACHED_IDLE_EXPIRE_AFTER_WARNING_MS = parseMs(
 );
 const PRODUCT_ATTACHED_IDLE_LIFETIME_MS = ATTACHED_IDLE_WARNING_MS + ATTACHED_IDLE_EXPIRE_AFTER_WARNING_MS;
 
-// E2B sandbox keepalive timeout. Clamp it so an old Render env var cannot undercut the product policy.
+// Product-level inactivity policy and E2B-level sandbox timeout are intentionally separate.
+// E2B enforces a hard maximum sandbox timeout of roughly 1 hour. We keep the sandbox alive
+// by refreshing that <=1h timeout while the browser terminal is attached. The product-level
+// “are you still there?” policy remains ATTACHED_IDLE_WARNING_MS + grace.
+const E2B_HARD_MAX_SANDBOX_TIMEOUT_MS = 60 * 60 * 1000;
+const E2B_SAFE_MAX_SANDBOX_TIMEOUT_MS = Math.min(
+  parseMs(process.env.E2B_MAX_SANDBOX_TIMEOUT_MS, 59 * 60 * 1000),
+  E2B_HARD_MAX_SANDBOX_TIMEOUT_MS - 1000
+);
 const RAW_TERMINAL_IDLE_TIMEOUT_MS = parseMs(
   process.env.TERMINAL_IDLE_TIMEOUT_MS ||
     process.env.SANDBOX_TIMEOUT_MS ||
     process.env.IDLE_TIMEOUT_MS,
-  PRODUCT_ATTACHED_IDLE_LIFETIME_MS
+  E2B_SAFE_MAX_SANDBOX_TIMEOUT_MS
 );
-const TERMINAL_IDLE_TIMEOUT_MS = Math.max(RAW_TERMINAL_IDLE_TIMEOUT_MS, PRODUCT_ATTACHED_IDLE_LIFETIME_MS);
+const TERMINAL_IDLE_TIMEOUT_MS = Math.min(RAW_TERMINAL_IDLE_TIMEOUT_MS, E2B_SAFE_MAX_SANDBOX_TIMEOUT_MS);
 
 const START_TIMEOUT_MS = parseMs(process.env.START_TIMEOUT_MS, 90 * 1000);
 const PROTOCOL_HEARTBEAT_MS = parseMs(process.env.PROTOCOL_HEARTBEAT_MS, 30 * 1000);
@@ -1218,7 +1226,10 @@ app.get('/health', async (req, res) => {
       defaultTemplateId: DEFAULT_TEMPLATE_ID,
       rawTerminalIdleTimeoutMs: RAW_TERMINAL_IDLE_TIMEOUT_MS,
       terminalIdleTimeoutMs: TERMINAL_IDLE_TIMEOUT_MS,
-      terminalIdleTimeoutClamped: TERMINAL_IDLE_TIMEOUT_MS !== RAW_TERMINAL_IDLE_TIMEOUT_MS,
+      terminalIdleTimeoutClampedDown: TERMINAL_IDLE_TIMEOUT_MS !== RAW_TERMINAL_IDLE_TIMEOUT_MS,
+      e2bHardMaxSandboxTimeoutMs: E2B_HARD_MAX_SANDBOX_TIMEOUT_MS,
+      e2bSafeMaxSandboxTimeoutMs: E2B_SAFE_MAX_SANDBOX_TIMEOUT_MS,
+      productAttachedIdleLifetimeMs: PRODUCT_ATTACHED_IDLE_LIFETIME_MS,
       startTimeoutMs: START_TIMEOUT_MS,
       protocolHeartbeatMs: PROTOCOL_HEARTBEAT_MS,
       detachedGraceMs: DETACHED_GRACE_MS,
@@ -1779,7 +1790,10 @@ server.listen(PORT, () => {
     defaultTemplateId: DEFAULT_TEMPLATE_ID,
     rawTerminalIdleTimeoutMs: RAW_TERMINAL_IDLE_TIMEOUT_MS,
     terminalIdleTimeoutMs: TERMINAL_IDLE_TIMEOUT_MS,
-    terminalIdleTimeoutClamped: TERMINAL_IDLE_TIMEOUT_MS !== RAW_TERMINAL_IDLE_TIMEOUT_MS,
+    terminalIdleTimeoutClampedDown: TERMINAL_IDLE_TIMEOUT_MS !== RAW_TERMINAL_IDLE_TIMEOUT_MS,
+      e2bHardMaxSandboxTimeoutMs: E2B_HARD_MAX_SANDBOX_TIMEOUT_MS,
+      e2bSafeMaxSandboxTimeoutMs: E2B_SAFE_MAX_SANDBOX_TIMEOUT_MS,
+      productAttachedIdleLifetimeMs: PRODUCT_ATTACHED_IDLE_LIFETIME_MS,
     startTimeoutMs: START_TIMEOUT_MS,
     protocolHeartbeatMs: PROTOCOL_HEARTBEAT_MS,
     detachedGraceMs: DETACHED_GRACE_MS,
