@@ -40,17 +40,6 @@ const ALLOWED_ORIGIN_SUFFIXES = (process.env.ALLOWED_ORIGIN_SUFFIXES || '')
 
 const DEFAULT_TEMPLATE_ID = process.env.DEFAULT_TEMPLATE_ID || 'base';
 
-// E2B sandbox keepalive timeout. This should be longer than the attached idle warning + grace window.
-const TERMINAL_IDLE_TIMEOUT_MS = parseMs(
-  process.env.TERMINAL_IDLE_TIMEOUT_MS ||
-    process.env.SANDBOX_TIMEOUT_MS ||
-    process.env.IDLE_TIMEOUT_MS,
-  4 * 60 * 60 * 1000 + 10 * 60 * 1000
-);
-
-const START_TIMEOUT_MS = parseMs(process.env.START_TIMEOUT_MS, 90 * 1000);
-const PROTOCOL_HEARTBEAT_MS = parseMs(process.env.PROTOCOL_HEARTBEAT_MS, 30 * 1000);
-
 // Learner-environment lifecycle policy.
 const DETACHED_GRACE_MS = parseMs(process.env.DETACHED_GRACE_MS || process.env.SESSION_GRACE_MS, 15 * 60 * 1000);
 const DETACHED_EXPIRE_MS = parseMs(process.env.DETACHED_EXPIRE_MS, 60 * 60 * 1000);
@@ -59,10 +48,30 @@ const ATTACHED_IDLE_EXPIRE_AFTER_WARNING_MS = parseMs(
   process.env.ATTACHED_IDLE_EXPIRE_AFTER_WARNING_MS,
   10 * 60 * 1000
 );
+const PRODUCT_ATTACHED_IDLE_LIFETIME_MS = ATTACHED_IDLE_WARNING_MS + ATTACHED_IDLE_EXPIRE_AFTER_WARNING_MS;
+
+// E2B sandbox keepalive timeout. Clamp it so an old Render env var cannot undercut the product policy.
+const RAW_TERMINAL_IDLE_TIMEOUT_MS = parseMs(
+  process.env.TERMINAL_IDLE_TIMEOUT_MS ||
+    process.env.SANDBOX_TIMEOUT_MS ||
+    process.env.IDLE_TIMEOUT_MS,
+  PRODUCT_ATTACHED_IDLE_LIFETIME_MS
+);
+const TERMINAL_IDLE_TIMEOUT_MS = Math.max(RAW_TERMINAL_IDLE_TIMEOUT_MS, PRODUCT_ATTACHED_IDLE_LIFETIME_MS);
+
+const START_TIMEOUT_MS = parseMs(process.env.START_TIMEOUT_MS, 90 * 1000);
+const PROTOCOL_HEARTBEAT_MS = parseMs(process.env.PROTOCOL_HEARTBEAT_MS, 30 * 1000);
 const ENVIRONMENT_RECORD_TTL_MS = parseMs(process.env.ENVIRONMENT_RECORD_TTL_MS, 24 * 60 * 60 * 1000);
 const ENVIRONMENT_SWEEP_MS = parseMs(process.env.ENVIRONMENT_SWEEP_MS, 60 * 1000);
 const TIMEOUT_REFRESH_THROTTLE_MS = parseMs(process.env.TIMEOUT_REFRESH_THROTTLE_MS, 60 * 1000);
+const STALE_ATTACHED_RECREATE_MS = parseMs(
+  process.env.STALE_ATTACHED_RECREATE_MS || process.env.STALE_ATTACHED_RECORD_MS,
+  TERMINAL_IDLE_TIMEOUT_MS + 60 * 1000
+);
+const REDIS_CONNECT_TIMEOUT_MS = parseMs(process.env.REDIS_CONNECT_TIMEOUT_MS, 5 * 1000);
+const REDIS_COMMAND_TIMEOUT_MS = parseMs(process.env.REDIS_COMMAND_TIMEOUT_MS, 5 * 1000);
 const ENABLE_LEGACY_START_CREATES_NEW = parseBool(process.env.ENABLE_LEGACY_START_CREATES_NEW, false);
+const REFRESH_SANDBOX_TIMEOUT_ON_PING = parseBool(process.env.REFRESH_SANDBOX_TIMEOUT_ON_PING, true);
 
 if (!E2B_API_KEY) throw new Error('E2B_API_KEY required');
 if (!TERMINAL_TOKEN_SECRET) throw new Error('TERMINAL_TOKEN_SECRET required');
@@ -88,9 +97,12 @@ app.use(express.json());
 
 const redis = REDIS_URL
   ? new Redis(REDIS_URL, {
-      maxRetriesPerRequest: 3,
+      maxRetriesPerRequest: 1,
       enableReadyCheck: true,
+      enableOfflineQueue: false,
       lazyConnect: true,
+      connectTimeout: REDIS_CONNECT_TIMEOUT_MS,
+      commandTimeout: REDIS_COMMAND_TIMEOUT_MS,
     })
   : null;
 
@@ -102,7 +114,7 @@ if (redis) {
   redis
     .connect()
     .then(() => console.log('[redis] connected'))
-    .catch((error) => console.error('[redis] initial connect failed', safePublicError(error)));
+    .catch((error) => console.error('[redis] initial connect failed; memory fallback active', safePublicError(error)));
 }
 
 class EnvironmentStore {
@@ -110,10 +122,16 @@ class EnvironmentStore {
     this.redis = redisClient;
     this.memory = new Map();
     this.prefix = 'c23forge:environment:';
+    this.lastRedisErrorAt = null;
   }
 
   key(environmentKey) {
     return `${this.prefix}${environmentKey}`;
+  }
+
+  noteRedisError(operation, error) {
+    this.lastRedisErrorAt = Date.now();
+    console.warn(`[environment-store] redis ${operation} failed; using memory fallback`, safePublicError(error));
   }
 
   serialize(record) {
@@ -131,11 +149,13 @@ class EnvironmentStore {
       lastActiveAt: record.lastActiveAt,
       lastAttachedAt: record.lastAttachedAt,
       lastDetachedAt: record.lastDetachedAt,
+      lastKeepAliveAt: record.lastKeepAliveAt || null,
       expiresAt: record.expiresAt,
       resetGeneration: record.resetGeneration || 0,
       diagnosticId: record.diagnosticId || 'no-diagnostic-id',
       adoptedFromClient: Boolean(record.adoptedFromClient),
       lastError: record.lastError || null,
+      staleReason: record.staleReason || null,
     });
   }
 
@@ -154,8 +174,13 @@ class EnvironmentStore {
     if (!environmentKey) return null;
 
     if (this.redis) {
-      const raw = await this.redis.get(this.key(environmentKey));
-      return this.deserialize(raw);
+      try {
+        const raw = await this.redis.get(this.key(environmentKey));
+        const redisRecord = this.deserialize(raw);
+        if (redisRecord) return redisRecord;
+      } catch (error) {
+        this.noteRedisError('get', error);
+      }
     }
 
     return this.deserialize(this.memory.get(environmentKey));
@@ -169,46 +194,61 @@ class EnvironmentStore {
       updatedAt: Date.now(),
     });
 
-    if (this.redis) {
-      await this.redis.set(this.key(record.environmentKey), serialized, 'PX', ENVIRONMENT_RECORD_TTL_MS);
-      return;
-    }
-
     this.memory.set(record.environmentKey, serialized);
+
+    if (this.redis) {
+      try {
+        await this.redis.set(this.key(record.environmentKey), serialized, 'PX', ENVIRONMENT_RECORD_TTL_MS);
+      } catch (error) {
+        this.noteRedisError('set', error);
+      }
+    }
   }
 
   async delete(environmentKey) {
     if (!environmentKey) return;
 
-    if (this.redis) {
-      await this.redis.del(this.key(environmentKey));
-      return;
-    }
-
     this.memory.delete(environmentKey);
+
+    if (this.redis) {
+      try {
+        await this.redis.del(this.key(environmentKey));
+      } catch (error) {
+        this.noteRedisError('delete', error);
+      }
+    }
   }
 
   async list() {
-    if (!this.redis) {
-      return Array.from(this.memory.values())
-        .map((raw) => this.deserialize(raw))
-        .filter(Boolean);
+    const byKey = new Map();
+
+    for (const [environmentKey, raw] of this.memory.entries()) {
+      const record = this.deserialize(raw);
+      if (record) byKey.set(environmentKey, record);
     }
 
-    const records = [];
-    let cursor = '0';
+    if (!this.redis) return Array.from(byKey.values());
 
-    do {
-      const [nextCursor, keys] = await this.redis.scan(cursor, 'MATCH', `${this.prefix}*`, 'COUNT', 100);
-      cursor = nextCursor;
+    try {
+      let cursor = '0';
 
-      if (keys.length > 0) {
-        const values = await this.redis.mget(keys);
-        records.push(...values.map((raw) => this.deserialize(raw)).filter(Boolean));
-      }
-    } while (cursor !== '0');
+      do {
+        const [nextCursor, keys] = await this.redis.scan(cursor, 'MATCH', `${this.prefix}*`, 'COUNT', 100);
+        cursor = nextCursor;
 
-    return records;
+        if (keys.length > 0) {
+          const values = await this.redis.mget(keys);
+          values
+            .map((raw) => this.deserialize(raw))
+            .filter(Boolean)
+            .forEach((record) => byKey.set(record.environmentKey, record));
+        }
+      } while (cursor !== '0');
+    } catch (error) {
+      this.noteRedisError('list', error);
+    }
+
+    return Array.from(byKey.values());
   }
 }
 
@@ -275,6 +315,7 @@ function normalizePid(value) {
 }
 
 function verifyTerminalToken(token) {
+  if (!token) throw new Error('Terminal token is required.');
   return jwt.verify(token, TERMINAL_TOKEN_SECRET, { algorithms: ['HS256'] });
 }
 
@@ -430,12 +471,31 @@ function getClientSandboxHints(msg, payload) {
   return { sandboxId, ptyPid };
 }
 
+function getEnvironmentExpiryReason(record, now = Date.now()) {
+  if (!record) return 'missing_record';
+  if (record.status === 'expired') return 'record_marked_expired';
+  if (record.status === 'error') return 'record_marked_error';
+  if (record.expiresAt && now > record.expiresAt) return 'record_expires_at_elapsed';
+
+  if (record.status === 'detached' && record.lastDetachedAt && now - record.lastDetachedAt > DETACHED_EXPIRE_MS) {
+    return 'detached_expire_elapsed';
+  }
+
+  const attachedLikeStatus = !record.status || record.status === 'attached' || record.status === 'ready' || record.status === 'connecting';
+  const hasRuntimeHandle = runtimeHandles.has(record.environmentKey);
+
+  if (attachedLikeStatus && !hasRuntimeHandle && record.lastActiveAt) {
+    const staleAgeMs = now - record.lastActiveAt;
+    if (staleAgeMs > STALE_ATTACHED_RECREATE_MS) {
+      return 'stale_attached_record';
+    }
+  }
+
+  return null;
+}
+
 function isEnvironmentExpired(record, now = Date.now()) {
-  if (!record) return true;
-  if (record.status === 'expired' || record.status === 'error') return true;
-  if (record.expiresAt && now > record.expiresAt) return true;
-  if (record.status === 'detached' && record.lastDetachedAt && now - record.lastDetachedAt > DETACHED_EXPIRE_MS) return true;
-  return false;
+  return Boolean(getEnvironmentExpiryReason(record, now));
 }
 
 function publicRecord(record) {
@@ -455,24 +515,28 @@ function publicRecord(record) {
     lastActiveAt: record.lastActiveAt,
     lastAttachedAt: record.lastAttachedAt,
     lastDetachedAt: record.lastDetachedAt,
+    lastKeepAliveAt: record.lastKeepAliveAt || null,
     expiresAt: record.expiresAt,
     resetGeneration: record.resetGeneration || 0,
+    staleReason: record.staleReason || null,
   };
 }
 
 async function refreshSandboxTimeout(handle, diagnosticId, force = false) {
-  if (!handle?.sandbox || typeof handle.sandbox.setTimeout !== 'function') return;
+  if (!handle?.sandbox || typeof handle.sandbox.setTimeout !== 'function') return false;
 
   const now = Date.now();
   if (!force && handle.lastTimeoutRefreshAt && now - handle.lastTimeoutRefreshAt < TIMEOUT_REFRESH_THROTTLE_MS) {
-    return;
+    return false;
   }
 
   try {
     await handle.sandbox.setTimeout(TERMINAL_IDLE_TIMEOUT_MS);
     handle.lastTimeoutRefreshAt = now;
+    return true;
   } catch (error) {
     warnWithDiag(diagnosticId, '[timeout refresh failed]', safePublicError(error));
+    return false;
   }
 }
 
@@ -487,7 +551,9 @@ async function markEnvironmentActivity(environmentKey, diagnosticId) {
     ...record,
     status: 'attached',
     lastActiveAt: now,
+    lastKeepAliveAt: now,
     expiresAt: null,
+    staleReason: null,
     diagnosticId,
   };
 
@@ -496,8 +562,26 @@ async function markEnvironmentActivity(environmentKey, diagnosticId) {
   const handle = runtimeHandles.get(environmentKey);
   if (handle) {
     handle.idleWarningSentAt = null;
+    runtimeHandles.set(environmentKey, handle);
     await refreshSandboxTimeout(handle, diagnosticId);
   }
+}
+
+async function markEnvironmentKeepAlive(environmentKey, diagnosticId) {
+  if (!environmentKey) return false;
+
+  const record = await environmentStore.get(environmentKey);
+  if (!record) return false;
+
+  const now = Date.now();
+  await environmentStore.set({
+    ...record,
+    status: record.status || 'attached',
+    lastKeepAliveAt: now,
+    diagnosticId,
+  });
+
+  return true;
 }
 
 async function disconnectRuntimeHandle(environmentKey, reason, options = {}) {
@@ -594,11 +678,13 @@ function makeBaseEnvironmentRecord(request, diagnosticId, existing = {}) {
     lastActiveAt: existing.lastActiveAt || now,
     lastAttachedAt: existing.lastAttachedAt || null,
     lastDetachedAt: existing.lastDetachedAt || null,
+    lastKeepAliveAt: existing.lastKeepAliveAt || null,
     expiresAt: existing.expiresAt || null,
     resetGeneration: existing.resetGeneration || 0,
     diagnosticId,
     adoptedFromClient: Boolean(existing.adoptedFromClient),
     lastError: null,
+    staleReason: null,
   };
 }
 
@@ -636,6 +722,7 @@ async function createAndAttachEnvironment(ws, msg, request, diagnosticId, option
     environmentMode: request.environmentMode,
     templateId: request.templateId,
     terminalIdleTimeoutMs: TERMINAL_IDLE_TIMEOUT_MS,
+    rawTerminalIdleTimeoutMs: RAW_TERMINAL_IDLE_TIMEOUT_MS,
   });
 
   const sandbox = await withTimeout(
@@ -675,6 +762,7 @@ async function createAndAttachEnvironment(ws, msg, request, diagnosticId, option
     lastActiveAt: now,
     lastAttachedAt: now,
     lastDetachedAt: null,
+    lastKeepAliveAt: now,
     expiresAt: null,
     diagnosticId,
   };
@@ -698,6 +786,7 @@ async function createAndAttachEnvironment(ws, msg, request, diagnosticId, option
     sandboxId: record.sandboxId,
     ptyPid: record.ptyPid,
     created: true,
+    reset: reason === 'reset',
   });
 
   sendWsMessage(ws, {
@@ -716,6 +805,7 @@ async function createAndAttachEnvironment(ws, msg, request, diagnosticId, option
     created: true,
     reset: reason === 'reset',
     previousExpired: Boolean(options.previousExpired),
+    previousExpiredReason: options.previousExpiredReason || null,
   });
 
   return record;
@@ -733,6 +823,8 @@ async function connectAndAttachEnvironment(ws, msg, record, diagnosticId, option
     environmentId: record.environmentId,
     sandboxId: record.sandboxId,
     ptyPid: record.ptyPid,
+    lastActiveAt: record.lastActiveAt,
+    lastKeepAliveAt: record.lastKeepAliveAt,
   });
 
   const sandbox = await withTimeout(
@@ -766,9 +858,11 @@ async function connectAndAttachEnvironment(ws, msg, record, diagnosticId, option
     lastActiveAt: now,
     lastAttachedAt: now,
     lastDetachedAt: null,
+    lastKeepAliveAt: now,
     expiresAt: null,
     diagnosticId,
     lastError: null,
+    staleReason: null,
   };
 
   runtimeHandles.set(record.environmentKey, {
@@ -835,12 +929,27 @@ async function attachOrCreateEnvironment(ws, msg, diagnosticId, options = {}) {
 
   let record = await environmentStore.get(request.environmentKey);
   let previousExpired = false;
+  let previousExpiredReason = null;
   let previousRecordForCreate = null;
 
-  if (record && isEnvironmentExpired(record, now)) {
+  const expiryReason = getEnvironmentExpiryReason(record, now);
+  if (record && expiryReason) {
     previousExpired = true;
-    previousRecordForCreate = record;
-    await destroyEnvironment(record, 'expired before attach', diagnosticId);
+    previousExpiredReason = expiryReason;
+    previousRecordForCreate = {
+      ...record,
+      staleReason: expiryReason,
+    };
+    warnWithDiag(diagnosticId, '[environment] existing record expired before attach', {
+      environmentKey: record.environmentKey,
+      sandboxId: record.sandboxId,
+      ptyPid: record.ptyPid,
+      expiryReason,
+      lastActiveAt: record.lastActiveAt,
+      lastDetachedAt: record.lastDetachedAt,
+      expiresAt: record.expiresAt,
+    });
+    await destroyEnvironment(record, `expired before attach: ${expiryReason}`, diagnosticId);
     record = null;
   }
 
@@ -850,7 +959,7 @@ async function attachOrCreateEnvironment(ws, msg, diagnosticId, options = {}) {
     record = null;
   }
 
-  if (!record && hints.sandboxId && hints.ptyPid) {
+  if (!record && hints.sandboxId && hints.ptyPid && !previousExpired) {
     record = makeBaseEnvironmentRecord(request, diagnosticId, {
       sandboxId: hints.sandboxId,
       ptyPid: hints.ptyPid,
@@ -883,8 +992,17 @@ async function attachOrCreateEnvironment(ws, msg, diagnosticId, options = {}) {
         message,
       });
 
+      await environmentStore.set({
+        ...record,
+        status: 'expired',
+        endedAt: Date.now(),
+        lastError: message,
+        staleReason: 'reattach_failed',
+      });
       await destroyEnvironment(record, 'stale environment could not be reattached', diagnosticId);
       previousExpired = true;
+      previousExpiredReason = 'reattach_failed';
+      previousRecordForCreate = record;
     }
   }
 
@@ -898,6 +1016,7 @@ async function attachOrCreateEnvironment(ws, msg, diagnosticId, options = {}) {
     previousRecord: seedRecord,
     resetGeneration,
     previousExpired,
+    previousExpiredReason,
   });
 }
 
@@ -980,6 +1099,62 @@ async function handleEnvironmentReset(ws, msg, diagnosticId) {
   return attachOrCreateEnvironment(ws, msg, diagnosticId, { forceNew: true });
 }
 
+async function handleHeartbeatPing(ws, msg, diagnosticId) {
+  let refreshed = false;
+  let keepAliveRecorded = false;
+
+  if (ws.__environmentKey) {
+    const handle = runtimeHandles.get(ws.__environmentKey);
+    if (handle && REFRESH_SANDBOX_TIMEOUT_ON_PING) {
+      refreshed = await refreshSandboxTimeout(handle, diagnosticId);
+    }
+    keepAliveRecorded = await markEnvironmentKeepAlive(ws.__environmentKey, diagnosticId);
+  } else if (ws.__legacySessionId) {
+    const session = legacySessions.get(ws.__legacySessionId);
+    if (session && REFRESH_SANDBOX_TIMEOUT_ON_PING) {
+      refreshed = await refreshSandboxTimeout(session, diagnosticId);
+      session.lastKeepAliveAt = Date.now();
+      legacySessions.set(ws.__legacySessionId, session);
+    }
+  }
+
+  sendWsMessage(ws, {
+    type: 'pong',
+    diagnosticId,
+    ts: Date.now(),
+    environmentKey: ws.__environmentKey || null,
+    sandboxTimeoutRefreshed: refreshed,
+    keepAliveRecorded,
+  });
+}
+
+async function handleRefreshToken(ws, msg, diagnosticId) {
+  let tokenValid = false;
+  let tokenEnvironmentKey = null;
+
+  try {
+    const payload = verifyTerminalToken(msg.token);
+    tokenValid = true;
+    tokenEnvironmentKey = payload.environmentKey || payload.environment_key || null;
+
+    if (ws.__environmentKey && tokenEnvironmentKey && tokenEnvironmentKey !== ws.__environmentKey) {
+      sendWsError(ws, diagnosticId, 'REFRESH_TOKEN_ENVIRONMENT_MISMATCH', 'Refreshed token environmentKey does not match active environment.');
+      return;
+    }
+  } catch (error) {
+    sendWsError(ws, diagnosticId, 'REFRESH_TOKEN_INVALID', safePublicError(error));
+    return;
+  }
+
+  sendWsMessage(ws, {
+    type: 'token_refreshed',
+    diagnosticId,
+    ts: Date.now(),
+    tokenValid,
+    environmentKey: ws.__environmentKey || tokenEnvironmentKey || null,
+  });
+}
+
 async function getEnvironmentStatus(req, res) {
   try {
     const auth = req.headers.authorization || '';
@@ -987,11 +1162,13 @@ async function getEnvironmentStatus(req, res) {
     const payload = verifyTerminalToken(token);
     const request = resolveEnvironmentRequest(req.query, payload);
     const record = await environmentStore.get(request.environmentKey);
+    const expiryReason = getEnvironmentExpiryReason(record);
 
     res.json({
       status: 'ok',
       exists: Boolean(record),
-      expired: record ? isEnvironmentExpired(record) : true,
+      expired: Boolean(expiryReason),
+      expiryReason,
       environment: publicRecord(record),
     });
   } catch (error) {
@@ -1008,7 +1185,7 @@ app.get('/health', async (req, res) => {
 
   try {
     records = await environmentStore.list();
-    storeStatus = redis ? 'redis' : 'memory';
+    storeStatus = redis ? 'redis+memory-fallback' : 'memory';
   } catch (error) {
     storeStatus = `error: ${safePublicError(error)}`;
   }
@@ -1018,6 +1195,10 @@ app.get('/health', async (req, res) => {
     return acc;
   }, {});
 
+  const staleRecords = records
+    .map((record) => ({ record, expiryReason: getEnvironmentExpiryReason(record) }))
+    .filter((item) => Boolean(item.expiryReason));
+
   res.json({
     status: 'ok',
     uptime: process.uptime(),
@@ -1026,20 +1207,29 @@ app.get('/health', async (req, res) => {
     legacyGatewaySessions: legacySessions.size,
     environmentRecords: records.length,
     environmentRecordsByStatus: byStatus,
+    staleEnvironmentRecords: staleRecords.length,
     store: storeStatus,
+    redis: {
+      configured: Boolean(REDIS_URL),
+      status: redis?.status || 'not_configured',
+      lastErrorAt: environmentStore.lastRedisErrorAt,
+    },
     config: {
       defaultTemplateId: DEFAULT_TEMPLATE_ID,
+      rawTerminalIdleTimeoutMs: RAW_TERMINAL_IDLE_TIMEOUT_MS,
       terminalIdleTimeoutMs: TERMINAL_IDLE_TIMEOUT_MS,
+      terminalIdleTimeoutClamped: TERMINAL_IDLE_TIMEOUT_MS !== RAW_TERMINAL_IDLE_TIMEOUT_MS,
       startTimeoutMs: START_TIMEOUT_MS,
       protocolHeartbeatMs: PROTOCOL_HEARTBEAT_MS,
       detachedGraceMs: DETACHED_GRACE_MS,
       detachedExpireMs: DETACHED_EXPIRE_MS,
       attachedIdleWarningMs: ATTACHED_IDLE_WARNING_MS,
       attachedIdleExpireAfterWarningMs: ATTACHED_IDLE_EXPIRE_AFTER_WARNING_MS,
+      staleAttachedRecreateMs: STALE_ATTACHED_RECREATE_MS,
       environmentRecordTtlMs: ENVIRONMENT_RECORD_TTL_MS,
       environmentSweepMs: ENVIRONMENT_SWEEP_MS,
       timeoutRefreshThrottleMs: TIMEOUT_REFRESH_THROTTLE_MS,
-      redisConfigured: Boolean(REDIS_URL),
+      refreshSandboxTimeoutOnPing: REFRESH_SANDBOX_TIMEOUT_ON_PING,
       legacyStartCreatesNew: ENABLE_LEGACY_START_CREATES_NEW,
       allowedOriginsConfigured: ALLOWED_ORIGINS.length,
       allowedOriginSuffixesConfigured: ALLOWED_ORIGIN_SUFFIXES.length,
@@ -1104,6 +1294,7 @@ async function startLegacySession(ws, msg, diagnosticId) {
     ptyPid: terminal.pid,
     createdAt: Date.now(),
     lastActiveAt: Date.now(),
+    lastKeepAliveAt: Date.now(),
     detachedAt: null,
     diagnosticId,
   };
@@ -1186,6 +1377,7 @@ async function resumeLegacySession(ws, msg, diagnosticId) {
     ptyPid,
     createdAt: Date.now(),
     lastActiveAt: Date.now(),
+    lastKeepAliveAt: Date.now(),
     detachedAt: null,
     diagnosticId,
   });
@@ -1216,6 +1408,7 @@ async function handleLegacyInput(ws, msg, diagnosticId) {
   await refreshSandboxTimeout(session, diagnosticId);
   await session.sandbox.pty.sendInput(session.ptyPid, new TextEncoder().encode(msg.data || ''));
   session.lastActiveAt = Date.now();
+  session.lastKeepAliveAt = Date.now();
   legacySessions.set(sessionId, session);
 }
 
@@ -1239,6 +1432,7 @@ async function handleLegacyResize(ws, msg, diagnosticId) {
     rows: msg.rows,
   });
   session.lastActiveAt = Date.now();
+  session.lastKeepAliveAt = Date.now();
   legacySessions.set(sessionId, session);
 }
 
@@ -1322,12 +1516,13 @@ wss.on('connection', (ws, req) => {
     }
 
     try {
-      if (msg.type === 'ping') {
-        sendWsMessage(ws, {
-          type: 'pong',
-          diagnosticId,
-          ts: Date.now(),
-        });
+      if (msg.type === 'ping' || msg.type === 'heartbeat' || msg.type === 'keepalive') {
+        await handleHeartbeatPing(ws, msg, diagnosticId);
+        return;
+      }
+
+      if (msg.type === 'refresh_token') {
+        await handleRefreshToken(ws, msg, diagnosticId);
         return;
       }
 
@@ -1475,12 +1670,24 @@ const environmentSweep = setInterval(async () => {
       if (!record?.environmentKey) continue;
 
       const handle = runtimeHandles.get(record.environmentKey);
+      const expiryReason = getEnvironmentExpiryReason(record, now);
 
       if (record.status === 'detached' && record.lastDetachedAt) {
-        const detachedAgeMs = now - record.lastDetachedAt;
-        if (detachedAgeMs > DETACHED_EXPIRE_MS) {
-          await destroyEnvironment(record, 'detached environment expired', record.diagnosticId || 'environment-sweep');
+        if (expiryReason) {
+          await destroyEnvironment(record, `environment sweep expired: ${expiryReason}`, record.diagnosticId || 'environment-sweep');
         }
+        continue;
+      }
+
+      if (!handle && expiryReason) {
+        warnWithDiag(record.diagnosticId || 'environment-sweep', '[environment sweep] stale record expired without active runtime handle', {
+          environmentKey: record.environmentKey,
+          expiryReason,
+          lastActiveAt: record.lastActiveAt,
+          lastDetachedAt: record.lastDetachedAt,
+          expiresAt: record.expiresAt,
+        });
+        await destroyEnvironment(record, `environment sweep expired stale record: ${expiryReason}`, record.diagnosticId || 'environment-sweep');
         continue;
       }
 
@@ -1495,6 +1702,7 @@ const environmentSweep = setInterval(async () => {
             code: 'ATTACHED_IDLE_TIMEOUT',
             diagnosticId: record.diagnosticId || 'environment-sweep',
             environmentKey: record.environmentKey,
+            idleAgeMs,
             message: 'Terminal environment expired after extended inactivity.',
           });
           await destroyEnvironment(record, 'attached idle timeout expired', record.diagnosticId || 'environment-sweep');
@@ -1569,16 +1777,20 @@ server.listen(PORT, () => {
   console.log(`[gateway] listening on port ${PORT}`);
   console.log('[gateway] config', {
     defaultTemplateId: DEFAULT_TEMPLATE_ID,
+    rawTerminalIdleTimeoutMs: RAW_TERMINAL_IDLE_TIMEOUT_MS,
     terminalIdleTimeoutMs: TERMINAL_IDLE_TIMEOUT_MS,
+    terminalIdleTimeoutClamped: TERMINAL_IDLE_TIMEOUT_MS !== RAW_TERMINAL_IDLE_TIMEOUT_MS,
     startTimeoutMs: START_TIMEOUT_MS,
     protocolHeartbeatMs: PROTOCOL_HEARTBEAT_MS,
     detachedGraceMs: DETACHED_GRACE_MS,
     detachedExpireMs: DETACHED_EXPIRE_MS,
     attachedIdleWarningMs: ATTACHED_IDLE_WARNING_MS,
     attachedIdleExpireAfterWarningMs: ATTACHED_IDLE_EXPIRE_AFTER_WARNING_MS,
+    staleAttachedRecreateMs: STALE_ATTACHED_RECREATE_MS,
     environmentRecordTtlMs: ENVIRONMENT_RECORD_TTL_MS,
     environmentSweepMs: ENVIRONMENT_SWEEP_MS,
     timeoutRefreshThrottleMs: TIMEOUT_REFRESH_THROTTLE_MS,
+    refreshSandboxTimeoutOnPing: REFRESH_SANDBOX_TIMEOUT_ON_PING,
     redisConfigured: Boolean(REDIS_URL),
     legacyStartCreatesNew: ENABLE_LEGACY_START_CREATES_NEW,
     allowedOriginsConfigured: ALLOWED_ORIGINS.length,
