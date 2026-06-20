@@ -40,29 +40,20 @@ const ALLOWED_ORIGIN_SUFFIXES = (process.env.ALLOWED_ORIGIN_SUFFIXES || '')
 
 const DEFAULT_TEMPLATE_ID = process.env.DEFAULT_TEMPLATE_ID || 'base';
 
-// Learner-environment lifecycle policy.
 const DETACHED_GRACE_MS = parseMs(process.env.DETACHED_GRACE_MS || process.env.SESSION_GRACE_MS, 15 * 60 * 1000);
 const DETACHED_EXPIRE_MS = parseMs(process.env.DETACHED_EXPIRE_MS, 60 * 60 * 1000);
 const ATTACHED_IDLE_WARNING_MS = parseMs(process.env.ATTACHED_IDLE_WARNING_MS, 4 * 60 * 60 * 1000);
-const ATTACHED_IDLE_EXPIRE_AFTER_WARNING_MS = parseMs(
-  process.env.ATTACHED_IDLE_EXPIRE_AFTER_WARNING_MS,
-  10 * 60 * 1000
-);
+const ATTACHED_IDLE_EXPIRE_AFTER_WARNING_MS = parseMs(process.env.ATTACHED_IDLE_EXPIRE_AFTER_WARNING_MS, 10 * 60 * 1000);
 const PRODUCT_ATTACHED_IDLE_LIFETIME_MS = ATTACHED_IDLE_WARNING_MS + ATTACHED_IDLE_EXPIRE_AFTER_WARNING_MS;
 
-// Product-level inactivity policy and E2B-level sandbox timeout are intentionally separate.
-// E2B enforces a hard maximum sandbox timeout of roughly 1 hour. We keep the sandbox alive
-// by refreshing that <=1h timeout while the browser terminal is attached. The product-level
-// “are you still there?” policy remains ATTACHED_IDLE_WARNING_MS + grace.
 const E2B_HARD_MAX_SANDBOX_TIMEOUT_MS = 60 * 60 * 1000;
 const E2B_SAFE_MAX_SANDBOX_TIMEOUT_MS = Math.min(
   parseMs(process.env.E2B_MAX_SANDBOX_TIMEOUT_MS, 59 * 60 * 1000),
   E2B_HARD_MAX_SANDBOX_TIMEOUT_MS - 1000
 );
+
 const RAW_TERMINAL_IDLE_TIMEOUT_MS = parseMs(
-  process.env.TERMINAL_IDLE_TIMEOUT_MS ||
-    process.env.SANDBOX_TIMEOUT_MS ||
-    process.env.IDLE_TIMEOUT_MS,
+  process.env.TERMINAL_IDLE_TIMEOUT_MS || process.env.SANDBOX_TIMEOUT_MS || process.env.IDLE_TIMEOUT_MS,
   E2B_SAFE_MAX_SANDBOX_TIMEOUT_MS
 );
 const TERMINAL_IDLE_TIMEOUT_MS = Math.min(RAW_TERMINAL_IDLE_TIMEOUT_MS, E2B_SAFE_MAX_SANDBOX_TIMEOUT_MS);
@@ -80,6 +71,9 @@ const REDIS_CONNECT_TIMEOUT_MS = parseMs(process.env.REDIS_CONNECT_TIMEOUT_MS, 5
 const REDIS_COMMAND_TIMEOUT_MS = parseMs(process.env.REDIS_COMMAND_TIMEOUT_MS, 5 * 1000);
 const ENABLE_LEGACY_START_CREATES_NEW = parseBool(process.env.ENABLE_LEGACY_START_CREATES_NEW, false);
 const REFRESH_SANDBOX_TIMEOUT_ON_PING = parseBool(process.env.REFRESH_SANDBOX_TIMEOUT_ON_PING, true);
+const SEND_OUTPUT_META = parseBool(process.env.SEND_OUTPUT_META, true);
+const PTY_PROBE_TIMEOUT_MS = parseMs(process.env.PTY_PROBE_TIMEOUT_MS, 10 * 1000);
+const SEND_INPUT_ACK_BEFORE_E2B = parseBool(process.env.SEND_INPUT_ACK_BEFORE_E2B, false);
 
 if (!E2B_API_KEY) throw new Error('E2B_API_KEY required');
 if (!TERMINAL_TOKEN_SECRET) throw new Error('TERMINAL_TOKEN_SECRET required');
@@ -158,6 +152,10 @@ class EnvironmentStore {
       lastAttachedAt: record.lastAttachedAt,
       lastDetachedAt: record.lastDetachedAt,
       lastKeepAliveAt: record.lastKeepAliveAt || null,
+      lastInputAt: record.lastInputAt || null,
+      lastOutputAt: record.lastOutputAt || null,
+      inputCount: record.inputCount || 0,
+      outputCount: record.outputCount || 0,
       expiresAt: record.expiresAt,
       resetGeneration: record.resetGeneration || 0,
       diagnosticId: record.diagnosticId || 'no-diagnostic-id',
@@ -261,8 +259,6 @@ class EnvironmentStore {
 }
 
 const environmentStore = new EnvironmentStore(redis);
-
-// Runtime handles are intentionally process-local. Durable metadata lives in EnvironmentStore.
 const runtimeHandles = new Map();
 const legacySessions = new Map();
 
@@ -275,9 +271,7 @@ function withTimeout(promise, ms, label) {
   let timer;
 
   const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      reject(new Error(`${label} timed out after ${ms}ms`));
-    }, ms);
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
   });
 
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
@@ -286,9 +280,7 @@ function withTimeout(promise, ms, label) {
 function isAllowedOrigin(origin) {
   if (!origin) return true;
 
-  if (ALLOWED_ORIGINS.includes(origin)) {
-    return true;
-  }
+  if (ALLOWED_ORIGINS.includes(origin)) return true;
 
   let parsed;
   try {
@@ -299,12 +291,9 @@ function isAllowedOrigin(origin) {
 
   const protocol = parsed.protocol;
   const hostname = parsed.hostname.toLowerCase();
-
   const isLocalhost = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
 
-  if (protocol !== 'https:' && !(protocol === 'http:' && isLocalhost)) {
-    return false;
-  }
+  if (protocol !== 'https:' && !(protocol === 'http:' && isLocalhost)) return false;
 
   return ALLOWED_ORIGIN_SUFFIXES.some((suffix) => hostname.endsWith(suffix));
 }
@@ -340,7 +329,6 @@ function logWithDiag(diagnosticId, message, data = undefined) {
     console.log(`[${diagnosticId}] ${message}`);
     return;
   }
-
   console.log(`[${diagnosticId}] ${message}`, data);
 }
 
@@ -349,7 +337,6 @@ function warnWithDiag(diagnosticId, message, data = undefined) {
     console.warn(`[${diagnosticId}] ${message}`);
     return;
   }
-
   console.warn(`[${diagnosticId}] ${message}`, data);
 }
 
@@ -358,7 +345,6 @@ function errorWithDiag(diagnosticId, message, data = undefined) {
     console.error(`[${diagnosticId}] ${message}`);
     return;
   }
-
   console.error(`[${diagnosticId}] ${message}`, data);
 }
 
@@ -370,41 +356,20 @@ function sendWsMessage(ws, msg) {
 
 function sendWsError(ws, diagnosticId, code, message, extra = {}) {
   errorWithDiag(diagnosticId, `[gateway error] ${code}: ${message}`);
-  sendWsMessage(ws, {
-    type: 'error',
-    code,
-    message,
-    diagnosticId,
-    ...extra,
-  });
+  sendWsMessage(ws, { type: 'error', code, message, diagnosticId, ...extra });
 }
 
 function safeKeyPart(value) {
-  return String(value || '')
-    .trim()
-    .replace(/[^A-Za-z0-9_.:@-]/g, '_');
+  return String(value || '').trim().replace(/[^A-Za-z0-9_.:@-]/g, '_');
 }
 
 function extractUserId(payload) {
-  return (
-    payload?.userId ||
-    payload?.user_id ||
-    payload?.sub ||
-    payload?.email ||
-    payload?.email_address ||
-    payload?.uid ||
-    null
-  );
+  return payload?.userId || payload?.user_id || payload?.sub || payload?.email || payload?.email_address || payload?.uid || null;
 }
 
 function normalizeEnvironmentMode(value) {
   const mode = value || 'user_default_environment';
-  const allowed = new Set([
-    'user_default_environment',
-    'fresh_isolated_environment',
-    'named_isolated_environment',
-  ]);
-
+  const allowed = new Set(['user_default_environment', 'fresh_isolated_environment', 'named_isolated_environment']);
   return allowed.has(mode) ? mode : 'user_default_environment';
 }
 
@@ -426,22 +391,17 @@ function resolveEnvironmentRequest(msg, payload) {
     throw new Error('Terminal token must include a stable userId, user_id, sub, or email claim for learner-environment attach/reset.');
   }
 
-  const environmentMode = normalizeEnvironmentMode(
-    msg.environmentMode || msg.environment_mode || payload.environmentMode || payload.environment_mode
-  );
+  const environmentMode = normalizeEnvironmentMode(msg.environmentMode || msg.environment_mode || payload.environmentMode || payload.environment_mode);
 
   let environmentKey = msg.environmentKey || msg.environment_key || payload.environmentKey || payload.environment_key;
-
   if (!environmentKey) {
-    environmentKey = environmentMode === 'user_default_environment'
-      ? defaultEnvironmentKeyForUser(userId)
-      : contentEnvironmentKeyForUser(userId, msg);
+    environmentKey = environmentMode === 'user_default_environment' ? defaultEnvironmentKeyForUser(userId) : contentEnvironmentKeyForUser(userId, msg);
   }
 
   const safeUserId = safeKeyPart(userId);
   const defaultKey = defaultEnvironmentKeyForUser(userId);
-
   const tokenEnvironmentKey = payload.environmentKey || payload.environment_key;
+
   if (tokenEnvironmentKey && tokenEnvironmentKey !== environmentKey) {
     throw new Error('Token environmentKey does not match requested environmentKey.');
   }
@@ -451,12 +411,7 @@ function resolveEnvironmentRequest(msg, payload) {
     throw new Error('Requested environmentKey is not scoped to the authenticated user.');
   }
 
-  return {
-    userId: String(userId),
-    environmentKey,
-    environmentMode,
-    templateId: getTemplateId(msg),
-  };
+  return { userId: String(userId), environmentKey, environmentMode, templateId: getTemplateId(msg) };
 }
 
 function validateResumeClaims(payload, sandboxId, ptyPid) {
@@ -483,6 +438,7 @@ function getEnvironmentExpiryReason(record, now = Date.now()) {
   if (!record) return 'missing_record';
   if (record.status === 'expired') return 'record_marked_expired';
   if (record.status === 'error') return 'record_marked_error';
+  if (record.status === 'stale') return record.staleReason || 'record_marked_stale';
   if (record.expiresAt && now > record.expiresAt) return 'record_expires_at_elapsed';
 
   if (record.status === 'detached' && record.lastDetachedAt && now - record.lastDetachedAt > DETACHED_EXPIRE_MS) {
@@ -494,21 +450,14 @@ function getEnvironmentExpiryReason(record, now = Date.now()) {
 
   if (attachedLikeStatus && !hasRuntimeHandle && record.lastActiveAt) {
     const staleAgeMs = now - record.lastActiveAt;
-    if (staleAgeMs > STALE_ATTACHED_RECREATE_MS) {
-      return 'stale_attached_record';
-    }
+    if (staleAgeMs > STALE_ATTACHED_RECREATE_MS) return 'stale_attached_record';
   }
 
   return null;
 }
 
-function isEnvironmentExpired(record, now = Date.now()) {
-  return Boolean(getEnvironmentExpiryReason(record, now));
-}
-
 function publicRecord(record) {
   if (!record) return null;
-
   return {
     environmentId: record.environmentId,
     environmentKey: record.environmentKey,
@@ -524,19 +473,39 @@ function publicRecord(record) {
     lastAttachedAt: record.lastAttachedAt,
     lastDetachedAt: record.lastDetachedAt,
     lastKeepAliveAt: record.lastKeepAliveAt || null,
+    lastInputAt: record.lastInputAt || null,
+    lastOutputAt: record.lastOutputAt || null,
+    inputCount: record.inputCount || 0,
+    outputCount: record.outputCount || 0,
     expiresAt: record.expiresAt,
     resetGeneration: record.resetGeneration || 0,
     staleReason: record.staleReason || null,
   };
 }
 
+function normalizeInputPayload(msg) {
+  if (msg.encoding === 'base64') {
+    return Buffer.from(String(msg.data || ''), 'base64');
+  }
+
+  if (Array.isArray(msg.data)) {
+    return Buffer.from(msg.data);
+  }
+
+  return Buffer.from(String(msg.data ?? ''), 'utf8');
+}
+
+async function sendInputToPty(sandbox, ptyPid, msg, requestTimeoutMs = START_TIMEOUT_MS) {
+  const bytes = Buffer.isBuffer(msg) || msg instanceof Uint8Array ? msg : normalizeInputPayload(msg);
+  await sandbox.pty.sendInput(ptyPid, bytes, { requestTimeoutMs });
+  return bytes.length;
+}
+
 async function refreshSandboxTimeout(handle, diagnosticId, force = false) {
   if (!handle?.sandbox || typeof handle.sandbox.setTimeout !== 'function') return false;
 
   const now = Date.now();
-  if (!force && handle.lastTimeoutRefreshAt && now - handle.lastTimeoutRefreshAt < TIMEOUT_REFRESH_THROTTLE_MS) {
-    return false;
-  }
+  if (!force && handle.lastTimeoutRefreshAt && now - handle.lastTimeoutRefreshAt < TIMEOUT_REFRESH_THROTTLE_MS) return false;
 
   try {
     await handle.sandbox.setTimeout(TERMINAL_IDLE_TIMEOUT_MS);
@@ -548,7 +517,7 @@ async function refreshSandboxTimeout(handle, diagnosticId, force = false) {
   }
 }
 
-async function markEnvironmentActivity(environmentKey, diagnosticId) {
+async function markEnvironmentActivity(environmentKey, diagnosticId, fields = {}) {
   if (!environmentKey) return;
 
   const record = await environmentStore.get(environmentKey);
@@ -563,6 +532,7 @@ async function markEnvironmentActivity(environmentKey, diagnosticId) {
     expiresAt: null,
     staleReason: null,
     diagnosticId,
+    ...fields,
   };
 
   await environmentStore.set(updated);
@@ -582,14 +552,22 @@ async function markEnvironmentKeepAlive(environmentKey, diagnosticId) {
   if (!record) return false;
 
   const now = Date.now();
+  await environmentStore.set({ ...record, status: record.status || 'attached', lastKeepAliveAt: now, diagnosticId });
+  return true;
+}
+
+async function markEnvironmentStale(environmentKey, diagnosticId, reason, message = null) {
+  if (!environmentKey) return;
+  const record = await environmentStore.get(environmentKey);
+  if (!record) return;
+
   await environmentStore.set({
     ...record,
-    status: record.status || 'attached',
-    lastKeepAliveAt: now,
+    status: 'stale',
+    staleReason: reason,
+    lastError: message,
     diagnosticId,
   });
-
-  return true;
 }
 
 async function disconnectRuntimeHandle(environmentKey, reason, options = {}) {
@@ -597,6 +575,8 @@ async function disconnectRuntimeHandle(environmentKey, reason, options = {}) {
   if (!handle) return;
 
   const { closeWs = false, suppressDetach = true } = options;
+
+  if (handle.pendingProbe?.timer) clearTimeout(handle.pendingProbe.timer);
 
   if (closeWs && handle.ws?.readyState === WS_OPEN) {
     handle.ws.__suppressDetach = suppressDetach;
@@ -608,9 +588,7 @@ async function disconnectRuntimeHandle(environmentKey, reason, options = {}) {
   }
 
   try {
-    if (handle.terminal && typeof handle.terminal.disconnect === 'function') {
-      await handle.terminal.disconnect();
-    }
+    if (handle.terminal && typeof handle.terminal.disconnect === 'function') await handle.terminal.disconnect();
   } catch (error) {
     warnWithDiag(handle.diagnosticId || 'no-diagnostic-id', '[runtime] terminal disconnect failed', safePublicError(error));
   }
@@ -671,7 +649,6 @@ async function destroyEnvironment(record, reason, diagnosticId = 'no-diagnostic-
 
 function makeBaseEnvironmentRecord(request, diagnosticId, existing = {}) {
   const now = Date.now();
-
   return {
     environmentId: existing.environmentId || uuidv4(),
     environmentKey: request.environmentKey,
@@ -687,6 +664,10 @@ function makeBaseEnvironmentRecord(request, diagnosticId, existing = {}) {
     lastAttachedAt: existing.lastAttachedAt || null,
     lastDetachedAt: existing.lastDetachedAt || null,
     lastKeepAliveAt: existing.lastKeepAliveAt || null,
+    lastInputAt: existing.lastInputAt || null,
+    lastOutputAt: existing.lastOutputAt || null,
+    inputCount: existing.inputCount || 0,
+    outputCount: existing.outputCount || 0,
     expiresAt: existing.expiresAt || null,
     resetGeneration: existing.resetGeneration || 0,
     diagnosticId,
@@ -698,18 +679,83 @@ function makeBaseEnvironmentRecord(request, diagnosticId, existing = {}) {
 
 function createTerminalOutputHandler(ws, environmentKey, diagnosticId) {
   return (data) => {
+    const bytes = Buffer.from(data);
+    const now = Date.now();
+    const handle = runtimeHandles.get(environmentKey);
+
+    if (handle) {
+      handle.lastOutputAt = now;
+      handle.outputCount = (handle.outputCount || 0) + 1;
+      handle.lastOutputBytes = bytes.length;
+      runtimeHandles.set(environmentKey, handle);
+    }
+
     sendWsMessage(ws, {
       type: 'output',
       diagnosticId,
       environmentKey,
-      data: Buffer.from(data).toString('base64'),
+      data: bytes.toString('base64'),
       encoding: 'base64',
     });
 
-    markEnvironmentActivity(environmentKey, diagnosticId).catch((error) => {
+    if (SEND_OUTPUT_META) {
+      sendWsMessage(ws, {
+        type: 'output_meta',
+        diagnosticId,
+        environmentKey,
+        bytes: bytes.length,
+        outputCount: handle ? handle.outputCount : null,
+        ts: now,
+      });
+    }
+
+    if (handle?.pendingProbe) {
+      const text = bytes.toString('utf8');
+      if (text.includes(handle.pendingProbe.sentinel)) {
+        clearTimeout(handle.pendingProbe.timer);
+        const probe = handle.pendingProbe;
+        handle.pendingProbe = null;
+        runtimeHandles.set(environmentKey, handle);
+
+        sendWsMessage(ws, {
+          type: 'probe_result',
+          diagnosticId,
+          environmentKey,
+          probeId: probe.probeId,
+          status: 'passed',
+          sentinel: probe.sentinel,
+          elapsedMs: Date.now() - probe.startedAt,
+        });
+
+        logWithDiag(diagnosticId, '[pty probe] passed', {
+          environmentKey,
+          probeId: probe.probeId,
+          elapsedMs: Date.now() - probe.startedAt,
+        });
+      }
+    }
+
+    markEnvironmentActivity(environmentKey, diagnosticId, {
+      lastOutputAt: now,
+      outputCount: handle ? handle.outputCount : undefined,
+    }).catch((error) => {
       warnWithDiag(diagnosticId, '[activity] failed to record terminal output activity', safePublicError(error));
     });
   };
+}
+
+function setRuntimeHandle(environmentKey, handle) {
+  runtimeHandles.set(environmentKey, {
+    environmentKey,
+    idleWarningSentAt: null,
+    lastTimeoutRefreshAt: 0,
+    lastInputAt: null,
+    lastOutputAt: null,
+    inputCount: 0,
+    outputCount: 0,
+    pendingProbe: null,
+    ...handle,
+  });
 }
 
 async function createAndAttachEnvironment(ws, msg, request, diagnosticId, options = {}) {
@@ -737,17 +783,12 @@ async function createAndAttachEnvironment(ws, msg, request, diagnosticId, option
     Sandbox.create(request.templateId, {
       apiKey: E2B_API_KEY,
       timeoutMs: TERMINAL_IDLE_TIMEOUT_MS,
-      lifecycle: {
-        onTimeout: 'pause',
-        autoResume: false,
-      },
+      lifecycle: { onTimeout: 'pause', autoResume: false },
       requestTimeoutMs: START_TIMEOUT_MS,
     }),
     START_TIMEOUT_MS,
     'Sandbox.create'
   );
-
-  const sandboxId = sandbox.sandboxId;
 
   const terminal = await withTimeout(
     sandbox.pty.create({
@@ -755,7 +796,7 @@ async function createAndAttachEnvironment(ws, msg, request, diagnosticId, option
       rows: msg.rows || 24,
       timeoutMs: 0,
       cwd: msg.cwd || '/home/user',
-      envs: { TERM: 'xterm-256color', ...(msg.envs || {}) },
+      envs: { TERM: 'xterm-256color', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', ...(msg.envs || {}) },
       onData: createTerminalOutputHandler(ws, request.environmentKey, diagnosticId),
     }),
     START_TIMEOUT_MS,
@@ -764,7 +805,7 @@ async function createAndAttachEnvironment(ws, msg, request, diagnosticId, option
 
   record = {
     ...record,
-    sandboxId,
+    sandboxId: sandbox.sandboxId,
     ptyPid: terminal.pid,
     status: 'attached',
     lastActiveAt: now,
@@ -775,16 +816,7 @@ async function createAndAttachEnvironment(ws, msg, request, diagnosticId, option
     diagnosticId,
   };
 
-  runtimeHandles.set(request.environmentKey, {
-    environmentKey: request.environmentKey,
-    sandbox,
-    terminal,
-    ws,
-    diagnosticId,
-    idleWarningSentAt: null,
-    lastTimeoutRefreshAt: 0,
-  });
-
+  setRuntimeHandle(request.environmentKey, { sandbox, terminal, ws, diagnosticId });
   await refreshSandboxTimeout(runtimeHandles.get(request.environmentKey), diagnosticId, true);
   await environmentStore.set(record);
 
@@ -822,9 +854,7 @@ async function createAndAttachEnvironment(ws, msg, request, diagnosticId, option
 async function connectAndAttachEnvironment(ws, msg, record, diagnosticId, options = {}) {
   const now = Date.now();
 
-  if (!record?.sandboxId || !record?.ptyPid) {
-    throw new Error('Cannot attach existing environment without sandboxId and ptyPid.');
-  }
+  if (!record?.sandboxId || !record?.ptyPid) throw new Error('Cannot attach existing environment without sandboxId and ptyPid.');
 
   logWithDiag(diagnosticId, '[environment] connecting existing sandbox', {
     environmentKey: record.environmentKey,
@@ -848,16 +878,15 @@ async function connectAndAttachEnvironment(ws, msg, record, diagnosticId, option
   const terminal = await withTimeout(
     sandbox.pty.connect(record.ptyPid, {
       onData: createTerminalOutputHandler(ws, record.environmentKey, diagnosticId),
+      timeoutMs: 0,
+      requestTimeoutMs: START_TIMEOUT_MS,
     }),
     START_TIMEOUT_MS,
     'sandbox.pty.connect'
   );
 
   if (msg.cols && msg.rows) {
-    await sandbox.pty.resize(record.ptyPid, {
-      cols: msg.cols,
-      rows: msg.rows,
-    });
+    await sandbox.pty.resize(record.ptyPid, { cols: msg.cols, rows: msg.rows }, { requestTimeoutMs: START_TIMEOUT_MS });
   }
 
   const updated = {
@@ -873,16 +902,7 @@ async function connectAndAttachEnvironment(ws, msg, record, diagnosticId, option
     staleReason: null,
   };
 
-  runtimeHandles.set(record.environmentKey, {
-    environmentKey: record.environmentKey,
-    sandbox,
-    terminal,
-    ws,
-    diagnosticId,
-    idleWarningSentAt: null,
-    lastTimeoutRefreshAt: 0,
-  });
-
+  setRuntimeHandle(record.environmentKey, { sandbox, terminal, ws, diagnosticId });
   await refreshSandboxTimeout(runtimeHandles.get(record.environmentKey), diagnosticId, true);
   await environmentStore.set(updated);
 
@@ -926,13 +946,8 @@ async function attachOrCreateEnvironment(ws, msg, diagnosticId, options = {}) {
 
   const existingHandle = runtimeHandles.get(request.environmentKey);
   if (existingHandle?.ws && existingHandle.ws !== ws) {
-    logWithDiag(diagnosticId, '[environment] superseding prior websocket attachment', {
-      environmentKey: request.environmentKey,
-    });
-    await disconnectRuntimeHandle(request.environmentKey, 'Superseded by a newer terminal attachment', {
-      closeWs: true,
-      suppressDetach: true,
-    });
+    logWithDiag(diagnosticId, '[environment] superseding prior websocket attachment', { environmentKey: request.environmentKey });
+    await disconnectRuntimeHandle(request.environmentKey, 'Superseded by a newer terminal attachment', { closeWs: true, suppressDetach: true });
   }
 
   let record = await environmentStore.get(request.environmentKey);
@@ -944,10 +959,7 @@ async function attachOrCreateEnvironment(ws, msg, diagnosticId, options = {}) {
   if (record && expiryReason) {
     previousExpired = true;
     previousExpiredReason = expiryReason;
-    previousRecordForCreate = {
-      ...record,
-      staleReason: expiryReason,
-    };
+    previousRecordForCreate = { ...record, staleReason: expiryReason };
     warnWithDiag(diagnosticId, '[environment] existing record expired before attach', {
       environmentKey: record.environmentKey,
       sandboxId: record.sandboxId,
@@ -988,9 +1000,7 @@ async function attachOrCreateEnvironment(ws, msg, diagnosticId, options = {}) {
 
   if (record?.sandboxId && record?.ptyPid && !options.forceNew) {
     try {
-      return await connectAndAttachEnvironment(ws, msg, record, diagnosticId, {
-        adoptedFromClient: Boolean(record.adoptedFromClient),
-      });
+      return await connectAndAttachEnvironment(ws, msg, record, diagnosticId, { adoptedFromClient: Boolean(record.adoptedFromClient) });
     } catch (error) {
       const message = safePublicError(error);
       warnWithDiag(diagnosticId, '[environment] attach existing failed; recreating environment', {
@@ -1000,13 +1010,7 @@ async function attachOrCreateEnvironment(ws, msg, diagnosticId, options = {}) {
         message,
       });
 
-      await environmentStore.set({
-        ...record,
-        status: 'expired',
-        endedAt: Date.now(),
-        lastError: message,
-        staleReason: 'reattach_failed',
-      });
+      await environmentStore.set({ ...record, status: 'expired', endedAt: Date.now(), lastError: message, staleReason: 'reattach_failed' });
       await destroyEnvironment(record, 'stale environment could not be reattached', diagnosticId);
       previousExpired = true;
       previousExpiredReason = 'reattach_failed';
@@ -1015,9 +1019,7 @@ async function attachOrCreateEnvironment(ws, msg, diagnosticId, options = {}) {
   }
 
   const seedRecord = previousRecordForCreate || record;
-  const resetGeneration = options.forceNew
-    ? Number(seedRecord?.resetGeneration || 0) + 1
-    : Number(seedRecord?.resetGeneration || 0);
+  const resetGeneration = options.forceNew ? Number(seedRecord?.resetGeneration || 0) + 1 : Number(seedRecord?.resetGeneration || 0);
 
   return createAndAttachEnvironment(ws, msg, request, diagnosticId, {
     reason: options.forceNew ? 'reset' : 'create',
@@ -1043,9 +1045,8 @@ async function detachEnvironmentForSocket(ws, diagnosticId) {
 
   if (handle?.ws === ws) {
     try {
-      if (handle.terminal && typeof handle.terminal.disconnect === 'function') {
-        await handle.terminal.disconnect();
-      }
+      if (handle.pendingProbe?.timer) clearTimeout(handle.pendingProbe.timer);
+      if (handle.terminal && typeof handle.terminal.disconnect === 'function') await handle.terminal.disconnect();
     } catch (error) {
       warnWithDiag(diagnosticId, '[environment] detach terminal disconnect failed', safePublicError(error));
     }
@@ -1055,13 +1056,7 @@ async function detachEnvironmentForSocket(ws, diagnosticId) {
 
   if (record) {
     const now = Date.now();
-    await environmentStore.set({
-      ...record,
-      status: 'detached',
-      lastDetachedAt: now,
-      expiresAt: now + DETACHED_EXPIRE_MS,
-      diagnosticId,
-    });
+    await environmentStore.set({ ...record, status: 'detached', lastDetachedAt: now, expiresAt: now + DETACHED_EXPIRE_MS, diagnosticId });
   }
 }
 
@@ -1069,15 +1064,64 @@ async function handleEnvironmentInput(ws, msg, diagnosticId) {
   const environmentKey = ws.__environmentKey;
   const handle = environmentKey ? runtimeHandles.get(environmentKey) : null;
   const record = environmentKey ? await environmentStore.get(environmentKey) : null;
+  const inputId = msg.inputId || msg.input_id || uuidv4();
 
   if (!handle?.sandbox || !handle?.terminal || !record?.ptyPid) {
-    sendWsError(ws, diagnosticId, 'NO_ACTIVE_TERMINAL', 'No active terminal is attached to this WebSocket.');
+    sendWsError(ws, diagnosticId, 'NO_ACTIVE_TERMINAL', 'No active terminal is attached to this WebSocket.', { inputId, environmentKey });
     return;
   }
 
+  const bytes = normalizeInputPayload(msg);
+  const now = Date.now();
+
+  if (SEND_INPUT_ACK_BEFORE_E2B) {
+    sendWsMessage(ws, {
+      type: 'input_ack',
+      diagnosticId,
+      environmentKey,
+      inputId,
+      phase: 'received_by_gateway',
+      bytes: bytes.length,
+      sandboxId: record.sandboxId,
+      ptyPid: record.ptyPid,
+      ts: now,
+    });
+  }
+
   await refreshSandboxTimeout(handle, diagnosticId);
-  await handle.sandbox.pty.sendInput(record.ptyPid, new TextEncoder().encode(msg.data || ''));
-  await markEnvironmentActivity(environmentKey, diagnosticId);
+  await sendInputToPty(handle.sandbox, record.ptyPid, bytes);
+
+  handle.lastInputAt = now;
+  handle.inputCount = (handle.inputCount || 0) + 1;
+  handle.lastInputBytes = bytes.length;
+  runtimeHandles.set(environmentKey, handle);
+
+  sendWsMessage(ws, {
+    type: 'input_ack',
+    diagnosticId,
+    environmentKey,
+    inputId,
+    phase: 'accepted_by_e2b_send_input',
+    bytes: bytes.length,
+    inputCount: handle.inputCount,
+    sandboxId: record.sandboxId,
+    ptyPid: record.ptyPid,
+    ts: Date.now(),
+  });
+
+  logWithDiag(diagnosticId, '[environment input] accepted by E2B sendInput', {
+    environmentKey,
+    inputId,
+    bytes: bytes.length,
+    inputCount: handle.inputCount,
+    sandboxId: record.sandboxId,
+    ptyPid: record.ptyPid,
+  });
+
+  await markEnvironmentActivity(environmentKey, diagnosticId, {
+    lastInputAt: now,
+    inputCount: Number(record.inputCount || 0) + 1,
+  });
 }
 
 async function handleEnvironmentResize(ws, msg, diagnosticId) {
@@ -1096,11 +1140,93 @@ async function handleEnvironmentResize(ws, msg, diagnosticId) {
   }
 
   await refreshSandboxTimeout(handle, diagnosticId);
-  await handle.sandbox.pty.resize(record.ptyPid, {
-    cols: msg.cols,
-    rows: msg.rows,
-  });
+  await handle.sandbox.pty.resize(record.ptyPid, { cols: msg.cols, rows: msg.rows }, { requestTimeoutMs: START_TIMEOUT_MS });
   await markEnvironmentActivity(environmentKey, diagnosticId);
+}
+
+async function handleEnvironmentProbe(ws, msg, diagnosticId) {
+  const environmentKey = ws.__environmentKey;
+  const handle = environmentKey ? runtimeHandles.get(environmentKey) : null;
+  const record = environmentKey ? await environmentStore.get(environmentKey) : null;
+
+  if (!handle?.sandbox || !handle?.terminal || !record?.ptyPid) {
+    sendWsError(ws, diagnosticId, 'NO_ACTIVE_TERMINAL', 'No active terminal is attached to this WebSocket.');
+    return;
+  }
+
+  if (handle.pendingProbe?.timer) clearTimeout(handle.pendingProbe.timer);
+
+  const probeId = msg.probeId || msg.probe_id || uuidv4();
+  const sentinel = `C23_GATEWAY_PROBE_OK_${probeId.replace(/[^A-Za-z0-9]/g, '').slice(0, 16)}`;
+  const startedAt = Date.now();
+
+  handle.pendingProbe = {
+    probeId,
+    sentinel,
+    startedAt,
+    timer: setTimeout(async () => {
+      const latestHandle = runtimeHandles.get(environmentKey);
+      if (!latestHandle?.pendingProbe || latestHandle.pendingProbe.probeId !== probeId) return;
+
+      latestHandle.pendingProbe = null;
+      runtimeHandles.set(environmentKey, latestHandle);
+      await markEnvironmentStale(environmentKey, diagnosticId, 'pty_probe_timeout', `PTY probe sentinel not observed within ${PTY_PROBE_TIMEOUT_MS}ms.`);
+
+      sendWsMessage(ws, {
+        type: 'probe_result',
+        diagnosticId,
+        environmentKey,
+        probeId,
+        status: 'failed',
+        reason: 'sentinel_timeout',
+        sentinel,
+        timeoutMs: PTY_PROBE_TIMEOUT_MS,
+      });
+
+      warnWithDiag(diagnosticId, '[pty probe] failed; environment marked stale', {
+        environmentKey,
+        probeId,
+        sentinel,
+        timeoutMs: PTY_PROBE_TIMEOUT_MS,
+      });
+    }, PTY_PROBE_TIMEOUT_MS),
+  };
+
+  runtimeHandles.set(environmentKey, handle);
+
+  const command = `printf '\\r\\n${sentinel}\\r\\n'; pwd; gcc --version | head -n 1\\r`;
+  await refreshSandboxTimeout(handle, diagnosticId, true);
+  await handle.sandbox.pty.sendInput(record.ptyPid, Buffer.from(command, 'utf8'), { requestTimeoutMs: START_TIMEOUT_MS });
+
+  sendWsMessage(ws, {
+    type: 'probe_started',
+    diagnosticId,
+    environmentKey,
+    probeId,
+    sentinel,
+    sandboxId: record.sandboxId,
+    ptyPid: record.ptyPid,
+    timeoutMs: PTY_PROBE_TIMEOUT_MS,
+  });
+
+  sendWsMessage(ws, {
+    type: 'input_ack',
+    diagnosticId,
+    environmentKey,
+    inputId: probeId,
+    phase: 'probe_accepted_by_e2b_send_input',
+    bytes: Buffer.byteLength(command, 'utf8'),
+    sandboxId: record.sandboxId,
+    ptyPid: record.ptyPid,
+    ts: Date.now(),
+  });
+
+  logWithDiag(diagnosticId, '[pty probe] started', {
+    environmentKey,
+    probeId,
+    sandboxId: record.sandboxId,
+    ptyPid: record.ptyPid,
+  });
 }
 
 async function handleEnvironmentReset(ws, msg, diagnosticId) {
@@ -1113,9 +1239,7 @@ async function handleHeartbeatPing(ws, msg, diagnosticId) {
 
   if (ws.__environmentKey) {
     const handle = runtimeHandles.get(ws.__environmentKey);
-    if (handle && REFRESH_SANDBOX_TIMEOUT_ON_PING) {
-      refreshed = await refreshSandboxTimeout(handle, diagnosticId);
-    }
+    if (handle && REFRESH_SANDBOX_TIMEOUT_ON_PING) refreshed = await refreshSandboxTimeout(handle, diagnosticId);
     keepAliveRecorded = await markEnvironmentKeepAlive(ws.__environmentKey, diagnosticId);
   } else if (ws.__legacySessionId) {
     const session = legacySessions.get(ws.__legacySessionId);
@@ -1171,6 +1295,7 @@ async function getEnvironmentStatus(req, res) {
     const request = resolveEnvironmentRequest(req.query, payload);
     const record = await environmentStore.get(request.environmentKey);
     const expiryReason = getEnvironmentExpiryReason(record);
+    const handle = runtimeHandles.get(request.environmentKey);
 
     res.json({
       status: 'ok',
@@ -1178,12 +1303,19 @@ async function getEnvironmentStatus(req, res) {
       expired: Boolean(expiryReason),
       expiryReason,
       environment: publicRecord(record),
+      runtimeHandle: handle
+        ? {
+            attached: true,
+            inputCount: handle.inputCount || 0,
+            outputCount: handle.outputCount || 0,
+            lastInputAt: handle.lastInputAt || null,
+            lastOutputAt: handle.lastOutputAt || null,
+            pendingProbe: Boolean(handle.pendingProbe),
+          }
+        : { attached: false },
     });
   } catch (error) {
-    res.status(400).json({
-      status: 'error',
-      message: safePublicError(error),
-    });
+    res.status(400).json({ status: 'error', message: safePublicError(error) });
   }
 }
 
@@ -1207,6 +1339,19 @@ app.get('/health', async (req, res) => {
     .map((record) => ({ record, expiryReason: getEnvironmentExpiryReason(record) }))
     .filter((item) => Boolean(item.expiryReason));
 
+  const runtimeDiagnostics = Array.from(runtimeHandles.values()).map((handle) => ({
+    environmentKey: handle.environmentKey,
+    diagnosticId: handle.diagnosticId || 'no-diagnostic-id',
+    wsOpen: handle.ws?.readyState === WS_OPEN,
+    inputCount: handle.inputCount || 0,
+    outputCount: handle.outputCount || 0,
+    lastInputAt: handle.lastInputAt || null,
+    lastOutputAt: handle.lastOutputAt || null,
+    lastInputBytes: handle.lastInputBytes || null,
+    lastOutputBytes: handle.lastOutputBytes || null,
+    pendingProbe: Boolean(handle.pendingProbe),
+  }));
+
   res.json({
     status: 'ok',
     uptime: process.uptime(),
@@ -1216,6 +1361,7 @@ app.get('/health', async (req, res) => {
     environmentRecords: records.length,
     environmentRecordsByStatus: byStatus,
     staleEnvironmentRecords: staleRecords.length,
+    runtimeDiagnostics,
     store: storeStatus,
     redis: {
       configured: Boolean(REDIS_URL),
@@ -1242,6 +1388,9 @@ app.get('/health', async (req, res) => {
       timeoutRefreshThrottleMs: TIMEOUT_REFRESH_THROTTLE_MS,
       refreshSandboxTimeoutOnPing: REFRESH_SANDBOX_TIMEOUT_ON_PING,
       legacyStartCreatesNew: ENABLE_LEGACY_START_CREATES_NEW,
+      sendOutputMeta: SEND_OUTPUT_META,
+      ptyProbeTimeoutMs: PTY_PROBE_TIMEOUT_MS,
+      sendInputAckBeforeE2b: SEND_INPUT_ACK_BEFORE_E2B,
       allowedOriginsConfigured: ALLOWED_ORIGINS.length,
       allowedOriginSuffixesConfigured: ALLOWED_ORIGIN_SUFFIXES.length,
       websocketPath: '/terminal',
@@ -1257,19 +1406,13 @@ async function startLegacySession(ws, msg, diagnosticId) {
   const sessionId = uuidv4();
   const templateId = getTemplateId(msg);
 
-  logWithDiag(diagnosticId, '[legacy start] creating sandbox', {
-    sessionId,
-    templateId,
-  });
+  logWithDiag(diagnosticId, '[legacy start] creating sandbox', { sessionId, templateId });
 
   const sandbox = await withTimeout(
     Sandbox.create(templateId, {
       apiKey: E2B_API_KEY,
       timeoutMs: TERMINAL_IDLE_TIMEOUT_MS,
-      lifecycle: {
-        onTimeout: 'pause',
-        autoResume: false,
-      },
+      lifecycle: { onTimeout: 'pause', autoResume: false },
       requestTimeoutMs: START_TIMEOUT_MS,
     }),
     START_TIMEOUT_MS,
@@ -1282,14 +1425,17 @@ async function startLegacySession(ws, msg, diagnosticId) {
       rows: msg.rows || 24,
       timeoutMs: 0,
       cwd: '/home/user',
-      envs: { TERM: 'xterm-256color' },
+      envs: { TERM: 'xterm-256color', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' },
       onData: (data) => {
-        sendWsMessage(ws, {
-          type: 'output',
-          diagnosticId,
-          data: Buffer.from(data).toString('base64'),
-          encoding: 'base64',
-        });
+        const bytes = Buffer.from(data);
+        const session = legacySessions.get(sessionId);
+        if (session) {
+          session.lastOutputAt = Date.now();
+          session.outputCount = (session.outputCount || 0) + 1;
+          legacySessions.set(sessionId, session);
+        }
+        sendWsMessage(ws, { type: 'output', diagnosticId, data: bytes.toString('base64'), encoding: 'base64' });
+        if (SEND_OUTPUT_META) sendWsMessage(ws, { type: 'output_meta', diagnosticId, bytes: bytes.length, ts: Date.now() });
       },
     }),
     START_TIMEOUT_MS,
@@ -1306,6 +1452,10 @@ async function startLegacySession(ws, msg, diagnosticId) {
     createdAt: Date.now(),
     lastActiveAt: Date.now(),
     lastKeepAliveAt: Date.now(),
+    lastInputAt: null,
+    lastOutputAt: null,
+    inputCount: 0,
+    outputCount: 0,
     detachedAt: null,
     diagnosticId,
   };
@@ -1328,7 +1478,6 @@ async function startLegacySession(ws, msg, diagnosticId) {
 
 async function resumeLegacySession(ws, msg, diagnosticId) {
   const payload = verifyTerminalToken(msg.token);
-
   const sandboxId = msg.sandboxId || payload.sandboxId;
   const ptyPid = normalizePid(msg.ptyPid || msg.pid || payload.ptyPid || payload.pid);
 
@@ -1341,11 +1490,7 @@ async function resumeLegacySession(ws, msg, diagnosticId) {
 
   const sessionId = msg.gatewaySessionId || payload.gatewaySessionId || uuidv4();
 
-  logWithDiag(diagnosticId, '[legacy resume] connecting', {
-    sessionId,
-    sandboxId,
-    ptyPid,
-  });
+  logWithDiag(diagnosticId, '[legacy resume] connecting', { sessionId, sandboxId, ptyPid });
 
   const sandbox = await withTimeout(
     Sandbox.connect(sandboxId, {
@@ -1359,25 +1504,25 @@ async function resumeLegacySession(ws, msg, diagnosticId) {
 
   const terminal = await withTimeout(
     sandbox.pty.connect(ptyPid, {
+      timeoutMs: 0,
+      requestTimeoutMs: START_TIMEOUT_MS,
       onData: (data) => {
-        sendWsMessage(ws, {
-          type: 'output',
-          diagnosticId,
-          data: Buffer.from(data).toString('base64'),
-          encoding: 'base64',
-        });
+        const bytes = Buffer.from(data);
+        const session = legacySessions.get(sessionId);
+        if (session) {
+          session.lastOutputAt = Date.now();
+          session.outputCount = (session.outputCount || 0) + 1;
+          legacySessions.set(sessionId, session);
+        }
+        sendWsMessage(ws, { type: 'output', diagnosticId, data: bytes.toString('base64'), encoding: 'base64' });
+        if (SEND_OUTPUT_META) sendWsMessage(ws, { type: 'output_meta', diagnosticId, bytes: bytes.length, ts: Date.now() });
       },
     }),
     START_TIMEOUT_MS,
     'sandbox.pty.connect'
   );
 
-  if (msg.cols && msg.rows) {
-    await sandbox.pty.resize(ptyPid, {
-      cols: msg.cols,
-      rows: msg.rows,
-    });
-  }
+  if (msg.cols && msg.rows) await sandbox.pty.resize(ptyPid, { cols: msg.cols, rows: msg.rows }, { requestTimeoutMs: START_TIMEOUT_MS });
 
   legacySessions.set(sessionId, {
     sessionId,
@@ -1389,9 +1534,14 @@ async function resumeLegacySession(ws, msg, diagnosticId) {
     createdAt: Date.now(),
     lastActiveAt: Date.now(),
     lastKeepAliveAt: Date.now(),
+    lastInputAt: null,
+    lastOutputAt: null,
+    inputCount: 0,
+    outputCount: 0,
     detachedAt: null,
     diagnosticId,
   });
+
   ws.__legacySessionId = sessionId;
 
   sendWsMessage(ws, {
@@ -1410,17 +1560,34 @@ async function resumeLegacySession(ws, msg, diagnosticId) {
 async function handleLegacyInput(ws, msg, diagnosticId) {
   const sessionId = ws.__legacySessionId;
   const session = sessionId ? legacySessions.get(sessionId) : null;
+  const inputId = msg.inputId || msg.input_id || uuidv4();
 
   if (!session?.sandbox || !session?.terminal || !session?.ptyPid) {
-    sendWsError(ws, diagnosticId, 'NO_ACTIVE_TERMINAL', 'No active terminal is attached to this WebSocket.');
+    sendWsError(ws, diagnosticId, 'NO_ACTIVE_TERMINAL', 'No active terminal is attached to this WebSocket.', { inputId });
     return;
   }
 
+  const bytes = normalizeInputPayload(msg);
   await refreshSandboxTimeout(session, diagnosticId);
-  await session.sandbox.pty.sendInput(session.ptyPid, new TextEncoder().encode(msg.data || ''));
+  await sendInputToPty(session.sandbox, session.ptyPid, bytes);
+
   session.lastActiveAt = Date.now();
   session.lastKeepAliveAt = Date.now();
+  session.lastInputAt = Date.now();
+  session.inputCount = (session.inputCount || 0) + 1;
   legacySessions.set(sessionId, session);
+
+  sendWsMessage(ws, {
+    type: 'input_ack',
+    diagnosticId,
+    inputId,
+    phase: 'accepted_by_e2b_send_input',
+    bytes: bytes.length,
+    inputCount: session.inputCount,
+    sandboxId: session.sandboxId,
+    ptyPid: session.ptyPid,
+    ts: Date.now(),
+  });
 }
 
 async function handleLegacyResize(ws, msg, diagnosticId) {
@@ -1438,10 +1605,7 @@ async function handleLegacyResize(ws, msg, diagnosticId) {
   }
 
   await refreshSandboxTimeout(session, diagnosticId);
-  await session.sandbox.pty.resize(session.ptyPid, {
-    cols: msg.cols,
-    rows: msg.rows,
-  });
+  await session.sandbox.pty.resize(session.ptyPid, { cols: msg.cols, rows: msg.rows }, { requestTimeoutMs: START_TIMEOUT_MS });
   session.lastActiveAt = Date.now();
   session.lastKeepAliveAt = Date.now();
   legacySessions.set(sessionId, session);
@@ -1455,9 +1619,7 @@ async function detachLegacySession(ws, diagnosticId) {
   if (!session) return;
 
   try {
-    if (session.terminal && typeof session.terminal.disconnect === 'function') {
-      await session.terminal.disconnect();
-    }
+    if (session.terminal && typeof session.terminal.disconnect === 'function') await session.terminal.disconnect();
   } catch (error) {
     warnWithDiag(diagnosticId, '[legacy detach] terminal disconnect failed', safePublicError(error));
   }
@@ -1593,15 +1755,15 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
+      if (msg.type === 'probe' || msg.type === 'probe_environment' || msg.type === 'pty_probe') {
+        await handleEnvironmentProbe(ws, msg, diagnosticId);
+        return;
+      }
+
       if (msg.type === 'idle_confirm') {
         if (ws.__environmentKey) {
           await markEnvironmentActivity(ws.__environmentKey, diagnosticId);
-          sendWsMessage(ws, {
-            type: 'idle_confirmed',
-            diagnosticId,
-            environmentKey: ws.__environmentKey,
-            ts: Date.now(),
-          });
+          sendWsMessage(ws, { type: 'idle_confirmed', diagnosticId, environmentKey: ws.__environmentKey, ts: Date.now() });
         }
         return;
       }
@@ -1641,13 +1803,8 @@ wss.on('connection', (ws, req) => {
     if (ws.__suppressDetach) return;
 
     try {
-      if (ws.__environmentKey) {
-        await detachEnvironmentForSocket(ws, diagnosticId);
-      }
-
-      if (ws.__legacySessionId) {
-        await detachLegacySession(ws, diagnosticId);
-      }
+      if (ws.__environmentKey) await detachEnvironmentForSocket(ws, diagnosticId);
+      if (ws.__legacySessionId) await detachLegacySession(ws, diagnosticId);
     } catch (error) {
       errorWithDiag(diagnosticId, '[close detach failed]', safePublicError(error));
     }
@@ -1684,9 +1841,7 @@ const environmentSweep = setInterval(async () => {
       const expiryReason = getEnvironmentExpiryReason(record, now);
 
       if (record.status === 'detached' && record.lastDetachedAt) {
-        if (expiryReason) {
-          await destroyEnvironment(record, `environment sweep expired: ${expiryReason}`, record.diagnosticId || 'environment-sweep');
-        }
+        if (expiryReason) await destroyEnvironment(record, `environment sweep expired: ${expiryReason}`, record.diagnosticId || 'environment-sweep');
         continue;
       }
 
@@ -1765,23 +1920,16 @@ const legacySweep = setInterval(async () => {
         }
       } finally {
         legacySessions.delete(sessionId);
-        console.log('[legacy sweep] pruned detached legacy session', { sessionId });
+        console.log('[legacy sweep] pruned detached session', { sessionId });
       }
     }
   }
-}, ENVIRONMENT_SWEEP_MS);
+}, Math.min(DETACHED_EXPIRE_MS, 60 * 60 * 1000));
 
 wss.on('close', () => {
   clearInterval(protocolHeartbeat);
   clearInterval(environmentSweep);
   clearInterval(legacySweep);
-});
-
-process.on('SIGTERM', () => {
-  console.log('[gateway] SIGTERM received; closing HTTP server without killing learner environments');
-  server.close(() => {
-    process.exit(0);
-  });
 });
 
 server.listen(PORT, () => {
@@ -1791,9 +1939,9 @@ server.listen(PORT, () => {
     rawTerminalIdleTimeoutMs: RAW_TERMINAL_IDLE_TIMEOUT_MS,
     terminalIdleTimeoutMs: TERMINAL_IDLE_TIMEOUT_MS,
     terminalIdleTimeoutClampedDown: TERMINAL_IDLE_TIMEOUT_MS !== RAW_TERMINAL_IDLE_TIMEOUT_MS,
-      e2bHardMaxSandboxTimeoutMs: E2B_HARD_MAX_SANDBOX_TIMEOUT_MS,
-      e2bSafeMaxSandboxTimeoutMs: E2B_SAFE_MAX_SANDBOX_TIMEOUT_MS,
-      productAttachedIdleLifetimeMs: PRODUCT_ATTACHED_IDLE_LIFETIME_MS,
+    e2bHardMaxSandboxTimeoutMs: E2B_HARD_MAX_SANDBOX_TIMEOUT_MS,
+    e2bSafeMaxSandboxTimeoutMs: E2B_SAFE_MAX_SANDBOX_TIMEOUT_MS,
+    productAttachedIdleLifetimeMs: PRODUCT_ATTACHED_IDLE_LIFETIME_MS,
     startTimeoutMs: START_TIMEOUT_MS,
     protocolHeartbeatMs: PROTOCOL_HEARTBEAT_MS,
     detachedGraceMs: DETACHED_GRACE_MS,
@@ -1805,8 +1953,11 @@ server.listen(PORT, () => {
     environmentSweepMs: ENVIRONMENT_SWEEP_MS,
     timeoutRefreshThrottleMs: TIMEOUT_REFRESH_THROTTLE_MS,
     refreshSandboxTimeoutOnPing: REFRESH_SANDBOX_TIMEOUT_ON_PING,
-    redisConfigured: Boolean(REDIS_URL),
     legacyStartCreatesNew: ENABLE_LEGACY_START_CREATES_NEW,
+    sendOutputMeta: SEND_OUTPUT_META,
+    ptyProbeTimeoutMs: PTY_PROBE_TIMEOUT_MS,
+    sendInputAckBeforeE2b: SEND_INPUT_ACK_BEFORE_E2B,
+    redisConfigured: Boolean(REDIS_URL),
     allowedOriginsConfigured: ALLOWED_ORIGINS.length,
     allowedOriginSuffixesConfigured: ALLOWED_ORIGIN_SUFFIXES.length,
     websocketPath: '/terminal',
